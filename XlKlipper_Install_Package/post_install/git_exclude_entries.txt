@@ -1,0 +1,18 @@
+# XlKlipper custom files - exclude from dirty tracking
+# Add these lines to /home/pi/klipper/.git/info/exclude
+klippy/extras/puppy_bootloader.py
+klippy/extras/puppy_bootloader.py.*
+klippy/extras/puppy_bootloader_working_probe.py.bak
+klippy/extras/dwarf_accelerometer.py
+klippy/extras/dwarf_accelerometer.py.*
+klippy/extras/dwarf_extruder.py.unused
+klippy/extras/led_effect.py
+klippy/extras/loadcell_probe.py
+klippy/extras/modbus_master.py
+klippy/extras/pca9557.py
+klippy/extras/babystep.py
+src/babystep.c
+src/modbus_stm32f4.c
+src/stm32/modbus_stm32f4.c
+.config_xlbuddy
+.config_xlbuddy.old

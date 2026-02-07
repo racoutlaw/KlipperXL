@@ -1,0 +1,176 @@
+# Loadcell Probe Configuration for Prusa XL
+# ==========================================
+#
+# This configuration enables the loadcell-based probing system that mimics
+# Prusa's behavior. The loadcell in each Dwarf toolhead measures nozzle
+# compression to detect bed contact.
+#
+# IMPORTANT: This requires the XL-specific MCU firmware with loadcell support.
+
+# =============================================================================
+# LOADCELL PROBE MODULE
+# =============================================================================
+
+[loadcell_probe]
+# MODBUS address of the Dwarf to use for probing
+# T0=0x1A, T1=0x1B, T2=0x1C, T3=0x1D, T4=0x1E
+dwarf_address: 0x1A
+
+# Trigger threshold in grams
+# Negative values = compression (nozzle pushing into bed)
+# Prusa uses -125g for static tare mode
+# Lower (more negative) = less sensitive, requires more force
+# Higher (less negative) = more sensitive, triggers earlier
+threshold_grams: -125.0
+
+# Probe speed in mm/s
+# Slower = more accurate but takes longer
+# Prusa uses 3.0 mm/s for final slow probe
+speed: 3.0
+
+# Retract speed in mm/s after probe
+lift_speed: 10.0
+
+# Number of probe samples per point
+# Multiple samples improve accuracy and detect bad probes
+samples: 3
+
+# Retract distance between samples (mm)
+sample_retract_dist: 2.0
+
+# Maximum allowed variation between samples (mm)
+# If samples vary more than this, probe fails
+samples_tolerance: 0.100
+
+# Number of samples for tare averaging
+# More samples = more accurate baseline, but slower
+# 48 samples @ 320Hz = 150ms (matches Prusa)
+tare_samples: 48
+
+# Z offset adjustment (mm)
+# Positive = nozzle further from bed
+# Calibrate this with paper test or first layer
+z_offset: 0.0
+
+# =============================================================================
+# SAFE Z HOMING
+# =============================================================================
+# Use the loadcell probe for Z homing at bed center
+
+[safe_z_home]
+home_xy_position: 125, 105   # Center of XL bed
+speed: 50.0
+z_hop: 10.0
+z_hop_speed: 5.0
+
+# =============================================================================
+# BED MESH (Optional)
+# =============================================================================
+# Uses loadcell probe for automatic bed mesh leveling
+
+[bed_mesh]
+speed: 150
+horizontal_move_z: 5
+mesh_min: 10, 10
+mesh_max: 240, 200
+probe_count: 5, 5
+algorithm: bicubic
+fade_start: 1
+fade_end: 10
+
+# =============================================================================
+# Z TILT ADJUST (For XL with multiple Z motors)
+# =============================================================================
+# Adjusts Z motors to level the gantry using loadcell probes
+
+[z_tilt]
+z_positions:
+    -10, 105    # Left Z motor
+    260, 105    # Right Z motor
+points:
+    30, 105     # Left probe point
+    220, 105    # Right probe point
+speed: 150
+horizontal_move_z: 5
+retries: 5
+retry_tolerance: 0.0075
+
+# =============================================================================
+# GCODE MACROS FOR LOADCELL PROBING
+# =============================================================================
+
+[gcode_macro PROBE_LOADCELL]
+description: Probe with loadcell and report result
+gcode:
+    # Tare first
+    LOADCELL_TARE
+    G4 P500  ; Wait for tare to settle
+    # Probe
+    LOADCELL_PROBE SAMPLES=3
+    # Report
+    LOADCELL_STATUS
+
+[gcode_macro CALIBRATE_Z_OFFSET]
+description: Calibrate loadcell probe Z offset
+gcode:
+    G28                          ; Home all axes
+    G1 X125 Y105 Z10 F3000       ; Move to center
+    LOADCELL_TARE                ; Tare the loadcell
+    LOADCELL_PROBE SAMPLES=1     ; Single probe
+    # Now use TESTZ to fine-tune with paper test
+    M117 Use TESTZ to adjust, then ACCEPT
+
+[gcode_macro BED_MESH_CALIBRATE_WITH_TARE]
+description: Bed mesh with loadcell tare between points
+gcode:
+    G28
+    LOADCELL_TARE
+    BED_MESH_CALIBRATE
+
+# =============================================================================
+# TOOLCHANGER INTEGRATION
+# =============================================================================
+# When changing tools, update the dwarf_address for the active tool
+
+[gcode_macro T0]
+gcode:
+    # ... tool change logic ...
+    # Update loadcell probe to use T0's Dwarf
+    SET_GCODE_VARIABLE MACRO=_LOADCELL_SET_TOOL VARIABLE=tool VALUE=0
+
+[gcode_macro T1]
+gcode:
+    # ... tool change logic ...
+    SET_GCODE_VARIABLE MACRO=_LOADCELL_SET_TOOL VARIABLE=tool VALUE=1
+
+[gcode_macro _LOADCELL_SET_TOOL]
+variable_tool: 0
+gcode:
+    # Map tool number to MODBUS address
+    # T0=0x1A, T1=0x1B, T2=0x1C, etc.
+    {% set addr = 0x1A + printer["gcode_macro _LOADCELL_SET_TOOL"].tool %}
+    RESPOND MSG="Loadcell: switching to tool {printer["gcode_macro _LOADCELL_SET_TOOL"].tool} at address {addr}"
+    # Note: Currently requires restart to change address
+    # Future: Add runtime address change support
+
+# =============================================================================
+# SAFETY MACROS
+# =============================================================================
+
+[gcode_macro _LOADCELL_CHECK]
+description: Verify loadcell is responding before critical operations
+gcode:
+    LOADCELL_STATUS
+    {% if printer.loadcell_probe.last_z_result is none %}
+        M117 Warning: Loadcell not calibrated
+        RESPOND TYPE=error MSG="Loadcell not calibrated - run LOADCELL_TARE first"
+    {% endif %}
+
+[gcode_macro PRINT_START]
+gcode:
+    # ... heat bed/hotend ...
+    G28                              ; Home
+    _LOADCELL_CHECK                  ; Verify loadcell
+    LOADCELL_TARE                    ; Fresh tare before mesh
+    BED_MESH_CALIBRATE               ; Create mesh with loadcell
+    # ... purge line, etc ...
