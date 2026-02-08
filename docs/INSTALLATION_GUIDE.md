@@ -91,7 +91,7 @@ sudo systemctl status klipper
 hostname -I
 ```
 
-Example: `YOUR_PI_IP`
+Example: `<YOUR_PI_IP>`
 
 ---
 
