@@ -1896,6 +1896,10 @@ class PuppyBootloader:
         self.gcode.register_command("DOCK_CALIBRATE", self.cmd_DOCK_CALIBRATE,
             desc="Calibrate dock position (tool must be manually attached)")
 
+        # Tool light
+        self.gcode.register_command("TOOL_LIGHT", self.cmd_TOOL_LIGHT,
+            desc="Turn tool nozzle light on/off")
+
         # Tool state override
         self.gcode.register_command("SET_TOOL_STATE", self.cmd_SET_TOOL_STATE,
             desc="Force tool state (for recovery after restart)")
@@ -5341,6 +5345,38 @@ class PuppyBootloader:
         self.gcode.respond_info(
             "Using default Prusa XL dock positions. "
             "Tool is now active on carriage.")
+
+    def cmd_TOOL_LIGHT(self, gcmd):
+        """Turn tool nozzle light on or off.
+        Usage: TOOL_LIGHT [STATE=<on|off>] [TOOL=<0-4>]
+        Defaults to active tool, toggles if no STATE given."""
+        state_str = gcmd.get('STATE', None)
+        tool = gcmd.get_int('TOOL', -1)
+        if tool == -1:
+            if not self.tool_picked:
+                raise gcmd.error("No tool picked and no TOOL specified")
+            tool = self.active_tool
+        dwarf = tool + 1
+        if dwarf not in self.booted_dwarfs:
+            raise gcmd.error(f"Tool {tool} (Dwarf {dwarf}) not available")
+        if state_str is not None:
+            on = state_str.lower() in ('on', '1', 'true')
+        else:
+            # Toggle: read current and flip
+            on = not getattr(self, '_tool_light_state', {}).get(tool, False)
+        if not hasattr(self, '_tool_light_state'):
+            self._tool_light_state = {}
+        if on:
+            value = (255 << 8) | 255  # Both selected and not_selected = full
+            self._tool_light_state[tool] = True
+        else:
+            value = 0  # Off regardless of selected state
+            self._tool_light_state[tool] = False
+        if self._write_register(dwarf, self.LED_REG_CHEESE, value):
+            state_msg = "ON" if on else "OFF"
+            self.gcode.respond_info(f"T{tool} nozzle light: {state_msg}")
+        else:
+            raise gcmd.error(f"Failed to write LED register on Dwarf {dwarf}")
 
     def cmd_SET_TOOL_STATE(self, gcmd):
         """Force the internal tool state. Use after manual tool changes.
