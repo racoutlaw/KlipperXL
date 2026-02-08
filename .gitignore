@@ -1,5 +1,5 @@
 .pi_connection
-.claude/settings.local.json
+.claude/
 *.pyc
 __pycache__/
 *.tar.gz
