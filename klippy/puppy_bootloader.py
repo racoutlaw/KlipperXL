@@ -1650,6 +1650,8 @@ class PuppyBootloader:
         self.tmc_enabled = {}  # {dwarf_num: True/False}
         self.tool_picked = False  # True if a tool is on the carriage
         self.led_pending = set()  # Dwarfs needing cheese LED config retry
+        self.tool_remap = {}  # {gcode_tool: physical_tool} for spool join
+        self._button_extrude_active = False  # True while button-driven extrude is in progress
 
         # Heater sync state - syncs [extruder] heater target to MODBUS
         self._extruder_heater = None  # Reference to [extruder] heater object
@@ -1763,6 +1765,7 @@ class PuppyBootloader:
         self._has_klipper_extruder = config.has_section('extruder')
         self._m104_overridden = False
         self.printer.register_event_handler("klippy:ready", self._override_m104_m109)
+        self.printer.register_event_handler("klippy:ready", self._override_turn_off_heaters)
         self.gcode.register_command("M106", self.cmd_M106,
             desc="Set fan speed")
         self.gcode.register_command("M107", self.cmd_M107,
@@ -1896,9 +1899,14 @@ class PuppyBootloader:
         self.gcode.register_command("DOCK_CALIBRATE", self.cmd_DOCK_CALIBRATE,
             desc="Calibrate dock position (tool must be manually attached)")
 
-        # Tool light
-        self.gcode.register_command("TOOL_LIGHT", self.cmd_TOOL_LIGHT,
-            desc="Turn tool nozzle light on/off")
+        # Spool join commands
+        self.gcode.register_command("SPOOL_JOIN", self.cmd_SPOOL_JOIN,
+            desc="Join spool: remap tool and transfer temp (use while paused)")
+        self.gcode.register_command("SPOOL_JOIN_STATUS", self.cmd_SPOOL_JOIN_STATUS,
+            desc="Show active spool join remaps")
+        self.gcode.register_command("SPOOL_JOIN_RESET", self.cmd_SPOOL_JOIN_RESET,
+            desc="Clear all spool join remaps")
+
 
         # Tool state override
         self.gcode.register_command("SET_TOOL_STATE", self.cmd_SET_TOOL_STATE,
@@ -2155,6 +2163,58 @@ class PuppyBootloader:
         _check_side_filament_runout() handles the actual runout PAUSE.
         """
         pass
+
+    def _read_tool_buttons(self, dwarf):
+        """Read button state from Dwarf discrete inputs.
+        Returns (btn_up, btn_down) or (False, False) on error."""
+        addr = self.ADDR_MODBUS_OFFSET + dwarf
+        data = [0x00, 0x00, 0x00, 0x04]  # Start at 0x0000, read 4 bits
+        frame = self._build_modbus_frame(addr, self.MODBUS_READ_DISCRETE, data)
+        try:
+            response = self._send_frame(frame)
+            status = response.get('status', -1)
+            resp_data = response.get('data', b'')
+            if status != 0 or not resp_data or len(resp_data) < 4:
+                return False, False
+            bits = resp_data[3]
+            return bool(bits & 0x04), bool(bits & 0x08)
+        except Exception:
+            return False, False
+
+    def _check_tool_buttons(self, dwarf, tool):
+        """Check tool buttons on active picked tool.
+        Button up = retract, button down = extrude.
+        Loops tight while button is held for responsive feel."""
+        btn_up, btn_down = self._read_tool_buttons(dwarf)
+
+        if not btn_up and not btn_down:
+            self._button_extrude_active = False
+            return
+
+        # Check tool is hot enough to extrude (170C minimum, matches Prusa EXTRUDE_MINTEMP)
+        temp = self.dwarf_data.get(dwarf, {}).get('hotend_temp', 0)
+        if temp < 170:
+            if not self._button_extrude_active:
+                self.gcode.respond_info(
+                    f"T{tool} too cold ({temp}C) - heat above 170C to use buttons")
+            return
+
+        # Tight loop while button is held - re-read button state between chunks
+        self._button_extrude_active = True
+        direction = -1.0 if btn_up else 1.0  # Up = retract, Down = extrude
+        chunk = 2.0  # 2mm per chunk
+        speed = 5.0  # 5mm/s
+        try:
+            while True:
+                self.gcode.run_script_from_command(
+                    f"G91\nG1 E{chunk * direction:.1f} F{speed * 60:.0f}\nG90")
+                # Re-read button state immediately after move completes
+                btn_up, btn_down = self._read_tool_buttons(dwarf)
+                if not btn_up and not btn_down:
+                    break
+        except Exception as e:
+            logging.info(f"PuppyBootloader: Button extrude error: {e}")
+        self._button_extrude_active = False
 
     # --- Side Filament Sensor Methods (PRIMARY runout detection, Prusa stock) ---
     # Side sensors are mounted near the spools: 3 left (T0,T1,T2) + 2 right (T3,T4)
@@ -3740,6 +3800,10 @@ class PuppyBootloader:
                         logging.info(f"PuppyBootloader: T{tool} filament: "
                                    f"{old_state} -> {new_state} (raw={fs_raw})")
                     self._check_filament_runout(tool, new_state)
+
+                    # Tool button check - only on active picked tool
+                    if self.tool_picked and tool == self.active_tool:
+                        self._check_tool_buttons(dwarf, tool)
             else:
                 # Poll failed - clear poll_time to trigger staleness detection
                 if dwarf in self.dwarf_data:
@@ -4500,7 +4564,12 @@ class PuppyBootloader:
         - Q: Just switch MODBUS, no physical movement (Q1)
         """
         def cmd(gcmd):
-            new_dwarf = tool_index + 1
+            # Spool join remap: if this gcode tool is remapped, use physical tool
+            physical_tool = self.tool_remap.get(tool_index, tool_index)
+            if physical_tool != tool_index:
+                self.gcode.respond_info(
+                    f"Spool join: T{tool_index} remapped to T{physical_tool}")
+            new_dwarf = physical_tool + 1
             quick = gcmd.get_int('Q', 0)
 
             # Parse Prusa slicer parameters (logged for debugging)
@@ -4566,7 +4635,7 @@ class PuppyBootloader:
                                f"temporarily disabled Klipper heater")
 
                 # NOW change active_tool - sensor switches to new tool's temperature
-                self.active_tool = tool_index
+                self.active_tool = physical_tool
                 # Set tool_picked=True for state coherence when TMC enabled
                 if new_dwarf in self.booted_dwarfs:
                     self.tool_picked = True
@@ -4578,7 +4647,7 @@ class PuppyBootloader:
                 new_tool_target = self.target_temps.get(new_dwarf, 0)
                 if new_tool_target > 0 and new_dwarf in self.booted_dwarfs:
                     self._write_register(new_dwarf, 0xE000, int(new_tool_target))
-                    logging.info(f"PuppyBootloader: Quick change - using T{tool_index} "
+                    logging.info(f"PuppyBootloader: Quick change - using T{physical_tool} "
                                f"stored target {new_tool_target}C")
 
                 # Set Klipper heater target to NEW tool's temp (allows extrusion)
@@ -4596,33 +4665,33 @@ class PuppyBootloader:
                 if new_tool_target > 0:
                     current_temp = self.dwarf_data.get(new_dwarf, {}).get('hotend_temp', 0)
                     if current_temp < (new_tool_target - 5):  # 5C tolerance
-                        self.gcode.respond_info(f"T{tool_index} at {current_temp}C - waiting for target {new_tool_target}C...")
+                        self.gcode.respond_info(f"T{physical_tool} at {current_temp}C - waiting for target {new_tool_target}C...")
                         self._wait_for_tool_temp(new_dwarf, new_tool_target, tolerance=5.0)
 
                 self._last_synced_temp = 0  # Force re-sync
 
                 self.gcode.respond_info(
-                    f"Tool {tool_index} active (Dwarf {new_dwarf}, TMC enabled)")
+                    f"Tool {physical_tool} active (Dwarf {new_dwarf}, TMC enabled)")
             else:
                 # Full physical tool change
-                if self.active_tool == tool_index and self.tool_picked:
+                if self.active_tool == physical_tool and self.tool_picked:
                     self.gcode.respond_info(
-                        f"T{tool_index} already picked!")
+                        f"T{physical_tool} already picked!")
                     return
 
                 # Store return position if S=0 (default: return after change)
                 no_return = (s_param >= 1)
 
-                if self.tool_picked and self.active_tool != tool_index:
+                if self.tool_picked and self.active_tool != physical_tool:
                     # Park current tool first
                     self.gcode.respond_info(
                         f"Parking T{self.active_tool}...")
                     self.gcode.run_script_from_command("TOOL_PARK")
                 if not self.tool_picked:
                     # Pick new tool
-                    self.gcode.respond_info(f"Picking T{tool_index}...")
+                    self.gcode.respond_info(f"Picking T{physical_tool}...")
                     self.gcode.run_script_from_command(
-                        f"TOOL_PICK T={tool_index}")
+                        f"TOOL_PICK T={physical_tool}")
         return cmd
 
     def _record_modbus_success(self, dwarf):
@@ -5346,37 +5415,6 @@ class PuppyBootloader:
             "Using default Prusa XL dock positions. "
             "Tool is now active on carriage.")
 
-    def cmd_TOOL_LIGHT(self, gcmd):
-        """Turn tool nozzle light on or off.
-        Usage: TOOL_LIGHT [STATE=<on|off>] [TOOL=<0-4>]
-        Defaults to active tool, toggles if no STATE given."""
-        state_str = gcmd.get('STATE', None)
-        tool = gcmd.get_int('TOOL', -1)
-        if tool == -1:
-            if not self.tool_picked:
-                raise gcmd.error("No tool picked and no TOOL specified")
-            tool = self.active_tool
-        dwarf = tool + 1
-        if dwarf not in self.booted_dwarfs:
-            raise gcmd.error(f"Tool {tool} (Dwarf {dwarf}) not available")
-        if state_str is not None:
-            on = state_str.lower() in ('on', '1', 'true')
-        else:
-            # Toggle: read current and flip
-            on = not getattr(self, '_tool_light_state', {}).get(tool, False)
-        if not hasattr(self, '_tool_light_state'):
-            self._tool_light_state = {}
-        if on:
-            value = (255 << 8) | 255  # Both selected and not_selected = full
-            self._tool_light_state[tool] = True
-        else:
-            value = 0  # Off regardless of selected state
-            self._tool_light_state[tool] = False
-        if self._write_register(dwarf, self.LED_REG_CHEESE, value):
-            state_msg = "ON" if on else "OFF"
-            self.gcode.respond_info(f"T{tool} nozzle light: {state_msg}")
-        else:
-            raise gcmd.error(f"Failed to write LED register on Dwarf {dwarf}")
 
     def cmd_SET_TOOL_STATE(self, gcmd):
         """Force the internal tool state. Use after manual tool changes.
@@ -5814,15 +5852,14 @@ class PuppyBootloader:
                         f"SAFETY: Hall sensor detects T{check_tool} is physically picked! "
                         f"Park it first or verify correct tool state.")
 
-        # Homing check - axes must be homed before tool change
+        # Auto-home if needed before tool change
         toolhead = self.printer.lookup_object('toolhead')
         curtime = self.reactor.monotonic()
         kin_status = toolhead.get_status(curtime)
         homed = kin_status.get('homed_axes', '')
-        if 'x' not in homed or 'y' not in homed:
-            raise gcmd.error("X and Y must be homed before TOOL_PICK!")
-        if 'z' not in homed:
-            raise gcmd.error("Z must be homed before TOOL_PICK!")
+        if 'x' not in homed or 'y' not in homed or 'z' not in homed:
+            self.gcode.respond_info("Axes not homed - homing all first...")
+            self.gcode.run_script_from_command("G28")
 
         # ============================================================
         # PRUSA-STYLE Z OFFSET COMPENSATION (from toolchanger.cpp)
@@ -6089,6 +6126,75 @@ class PuppyBootloader:
             self.gcode.respond_info(
                 f"New tool nozzle is {-nozzle_z_diff:.3f}mm shorter - compensated via gcode offset")
 
+    def cmd_SPOOL_JOIN(self, gcmd):
+        """Join spool: remap gcode tool to physical tool, transfer temp.
+        Usage: SPOOL_JOIN TO=<tool> [FROM=<tool>]
+        FROM defaults to the currently active tool.
+        Use while print is paused after filament runout.
+        Example: SPOOL_JOIN TO=3"""
+        to_tool = gcmd.get_int('TO', -1)
+        from_tool = gcmd.get_int('FROM', self.active_tool)
+        if from_tool < 0 or from_tool > 4:
+            raise gcmd.error("FROM must be 0-4 (or omit to use active tool)")
+        if to_tool < 0 or to_tool > 4:
+            raise gcmd.error("TO must be 0-4")
+        if from_tool == to_tool:
+            raise gcmd.error("FROM and TO must be different")
+        to_dwarf = to_tool + 1
+        from_dwarf = from_tool + 1
+        if to_dwarf not in self.booted_dwarfs:
+            raise gcmd.error(f"T{to_tool} (Dwarf {to_dwarf}) not available")
+
+        # Transfer temperature from old tool to new tool
+        old_target = self.target_temps.get(from_dwarf, 0)
+        if old_target > 0:
+            self._write_register(to_dwarf, 0xE000, int(old_target))
+            self.target_temps[to_dwarf] = old_target
+            self.gcode.respond_info(
+                f"Transferred {old_target}C from T{from_tool} to T{to_tool}")
+
+        # Cool down old tool
+        self._write_register(from_dwarf, 0xE000, 0)
+        self.target_temps[from_dwarf] = 0
+        self.gcode.respond_info(f"T{from_tool} heater off")
+
+        # Set up remap so future Tx gcode uses physical tool
+        self.tool_remap[from_tool] = to_tool
+        self.gcode.respond_info(
+            f"Spool join active: T{from_tool} -> T{to_tool}")
+
+        # If from_tool is currently picked, do the physical swap
+        if self.tool_picked and self.active_tool == from_tool:
+            self.gcode.respond_info(
+                f"Swapping: parking T{from_tool}, picking T{to_tool}...")
+            self.gcode.run_script_from_command("TOOL_PARK")
+            self.gcode.run_script_from_command(f"TOOL_PICK T={to_tool}")
+            # Wait for new tool to reach temp
+            if old_target > 0:
+                self.gcode.respond_info(
+                    f"Waiting for T{to_tool} to reach {old_target}C...")
+                self._wait_for_tool_temp(to_dwarf, old_target, tolerance=5.0)
+            self.gcode.respond_info(
+                f"Spool join complete. T{to_tool} ready. Resume print.")
+        else:
+            self.gcode.respond_info(
+                f"Remap set. Next time gcode calls T{from_tool}, "
+                f"T{to_tool} will be used instead.")
+
+    def cmd_SPOOL_JOIN_STATUS(self, gcmd):
+        """Show active spool join remaps."""
+        if not self.tool_remap:
+            self.gcode.respond_info("No spool join remaps active")
+            return
+        for gcode_tool, phys_tool in sorted(self.tool_remap.items()):
+            self.gcode.respond_info(
+                f"T{gcode_tool} -> T{phys_tool}")
+
+    def cmd_SPOOL_JOIN_RESET(self, gcmd):
+        """Clear all spool join remaps."""
+        self.tool_remap.clear()
+        self.gcode.respond_info("All spool join remaps cleared")
+
     def cmd_TOOL_PARK(self, gcmd):
         """Park the current tool back in its dock.
         Usage: TOOL_PARK"""
@@ -6125,6 +6231,13 @@ class PuppyBootloader:
         # NOTE: NO retract here - Prusa doesn't retract in park()!
         # The slicer handles retraction at the wipe tower via generated G-code.
         # Adding retract here without matching prime caused issues.
+
+        # CRITICAL: Clear gcode offsets BEFORE parking moves!
+        # Dock coordinates are in machine space. G1 commands operate in gcode space.
+        # With tool offsets active, G1 X271 would go to X=271+offset, exceeding limits.
+        # Prusa also removes tool offsets before parking (hotend_currently_applied_offset).
+        self.gcode.run_script_from_command("SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0")
+        self.applied_tool_offset = (0.0, 0.0, 0.0)
 
         dock_x = self._get_dock_x(tool)
         dock_y = self._get_dock_y(tool)
@@ -6226,15 +6339,7 @@ class PuppyBootloader:
             self._extruder_heater.set_temp(0.)
             logging.info("PuppyBootloader: TOOL_PARK cleared Klipper heater target (no tool active)")
 
-        # Clear tool XY offsets but preserve loadcell Z offset
-        # Clear all offsets when tool is parked
-        # With Prusa-style loadcell probing, Z=0 is where nozzle touches bed
-        # No tool = no offset needed (next tool pick will apply its offset)
-        self.gcode.run_script_from_command("SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0")
-
-        # Reset applied offset tracking (Prusa's hotend_currently_applied_offset)
-        # When no tool is picked, we consider zero tool offset applied
-        self.applied_tool_offset = (0.0, 0.0, 0.0)
+        # Offsets already cleared at start of TOOL_PARK (before dock moves)
 
         self.gcode.respond_info(f"T{tool} parked successfully!")
 
@@ -6743,6 +6848,32 @@ class PuppyBootloader:
         except Exception as e:
             logging.error(f"PuppyBootloader: Failed to register M104/M109: {e}")
 
+    def _override_turn_off_heaters(self):
+        """Override TURN_OFF_HEATERS to also clear MODBUS heater targets."""
+        try:
+            self.gcode.register_command("TURN_OFF_HEATERS", None)
+            self.gcode.register_command("TURN_OFF_HEATERS",
+                self.cmd_TURN_OFF_HEATERS,
+                desc="Turn off all heaters (including MODBUS)")
+            logging.info("PuppyBootloader: Overrode TURN_OFF_HEATERS")
+        except Exception as e:
+            logging.error(f"PuppyBootloader: Failed to override TURN_OFF_HEATERS: {e}")
+
+    def cmd_TURN_OFF_HEATERS(self, gcmd):
+        """Turn off ALL heaters - Klipper + all MODBUS dwarfs."""
+        # Clear all stored targets so sync doesn't re-heat
+        self.target_temps.clear()
+        self._last_synced_temp = 0
+        # Write 0 to all dwarfs
+        for dwarf in self.booted_dwarfs:
+            self._write_register(dwarf, 0xE000, 0)
+        # Turn off Klipper heaters (extruder + bed)
+        pheaters = self.printer.lookup_object('heaters', None)
+        if pheaters is not None:
+            for name, heater in pheaters.heaters.items():
+                heater.set_temp(0.)
+        self.gcode.respond_info("All heaters off (including MODBUS)")
+
     def _override_m84(self):
         """Override Klipper's M84/M18 commands at klippy:ready time."""
         # Check if we've already overridden (guard against multiple calls)
@@ -7246,7 +7377,13 @@ class DwarfTemperatureSensor:
 
         # Use poll timestamp for staleness check (not value change)
         if raw_temp is not None:
-            self.temp = float(raw_temp)
+            temp_val = float(raw_temp)
+            # Sanity clamp: discard garbage MODBUS reads (e.g. 0xFFFF during tool change)
+            if temp_val < -10.0 or temp_val > 500.0:
+                logging.warning(f"DwarfTemperatureSensor: Dwarf {dwarf} "
+                              f"bogus reading {temp_val}C - ignoring")
+            else:
+                self.temp = temp_val
             # Update our tracking time from when polling actually occurred
             if poll_time > 0:
                 self._last_update_time = poll_time
@@ -7293,12 +7430,17 @@ class DwarfHeater:
         self._target_temp = degrees
         if self._puppy:
             self._puppy._write_register(self._dwarf, self.HEATER_REG, int(degrees))
+            # Keep target_temps in sync so _sync_extruder_heater doesn't fight
+            self._puppy.target_temps[self._dwarf] = int(degrees)
 
     def get_temp(self):
         """Get current temp from polling data."""
         if self._puppy:
             data = self._puppy.dwarf_data.get(self._dwarf, {})
-            return float(data.get('hotend_temp', 0))
+            temp = float(data.get('hotend_temp', 0))
+            if temp < -10.0 or temp > 500.0:
+                return 0.0  # Discard garbage MODBUS reads
+            return temp
         return 0.0
 
     def get_target_temp(self):
