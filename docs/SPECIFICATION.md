@@ -254,32 +254,38 @@ class ModbusMaster:
 
 ## 5. Implementation Phases
 
-### Phase 1: MCU MODBUS Driver (Week 1-2)
-- [ ] Implement UART setup for USART3
-- [ ] Implement RS485 direction control
-- [ ] Implement MODBUS RTU framing (CRC16)
-- [ ] Implement basic read/write functions
-- [ ] Test with logic analyzer
+### Phase 1: MCU MODBUS Driver - COMPLETE
+- [x] Implement UART setup for USART3
+- [x] Implement RS485 direction control
+- [x] Implement MODBUS RTU framing (CRC16)
+- [x] Implement basic read/write functions
+- [x] Test with logic analyzer
 
-### Phase 2: Klipper Integration (Week 2-3)
-- [ ] Create Klipper command interface
-- [ ] Create Python host module
-- [ ] Implement register read/write from host
-- [ ] Test basic communication
+### Phase 2: Klipper Integration - COMPLETE
+- [x] Create Klipper command interface
+- [x] Create Python host module
+- [x] Implement register read/write from host
+- [x] Test basic communication
 
-### Phase 3: Dwarf Wrapper (Week 3-4)
-- [ ] Create prusa_dwarf.py
-- [ ] Implement heater control
-- [ ] Implement fan control
-- [ ] Implement temperature reading
-- [ ] Implement TMC driver access
+### Phase 3: Dwarf Control - COMPLETE
+- [x] Dwarf boot sequencing and registration
+- [x] Heater control (per-tool, multi-tool preservation)
+- [x] Fan control (print fan + heatbreak fan)
+- [x] Temperature reading and display
+- [x] TMC driver access
 
-### Phase 4: Full Integration (Week 4-5)
-- [ ] Multi-tool support
-- [ ] Toolchanger macros
-- [ ] Loadcell probing
-- [ ] Filament sensor
-- [ ] Testing & debugging
+### Phase 4: Full Integration - COMPLETE
+- [x] Multi-tool support (5 tools, automatic park/pick)
+- [x] Toolchanger macros (Prusa-matched dock sequences)
+- [x] Loadcell probing (Z home, bed mesh, tool calibration)
+- [x] Filament sensor monitoring and autoload
+- [x] Tool offset calibration (G425 equivalent)
+- [x] Spool join (tool remapping on runout)
+- [x] Tool buttons (physical load/unload)
+- [x] Modular bed control (16-zone adaptive heating)
+- [x] Side LED strips (status effects)
+- [x] Input shaper (Dwarf accelerometer)
+- [x] Stable multi-day operation verified
 
 ---
 
@@ -352,7 +358,7 @@ pin: modbus:T0:fan0
 
 ## 9. Resources
 
-- Prusa Firmware Source: `G:\klipper-prusa files\Prusa-Firmware-Buddy-master\`
+- Prusa Firmware Source: `Prusa-Firmware-Buddy/` (reference archive)
 - Klipper Source: https://github.com/Klipper3d/klipper
 - STM32F407 Reference Manual
 - MODBUS RTU Specification
@@ -360,5 +366,6 @@ pin: modbus:T0:fan0
 ---
 
 *Created: January 2026*
-*Author: Claude + Richard*
-*Status: PLANNING*
+*Last Updated: February 2026*
+*Author: Richard Crook*
+*Status: WORKING - All phases complete, deployed on 5-tool Prusa XL*

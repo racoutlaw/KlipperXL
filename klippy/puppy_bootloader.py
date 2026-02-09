@@ -1541,6 +1541,24 @@ class PuppyBootloader:
     # Bed coils (for clearing faults - same as Prusa refresh cycle)
     BED_COIL_CLEAR_FAULT = 0x4000    # SystemCoil: clear_fault_status
     BED_COIL_RESET_OVERCURRENT = 0x4001  # SystemCoil: reset_overcurrent_fault
+    BED_COIL_PRINT_FAN_ACTIVE = 0x4005   # SystemCoil: print_fan_active
+
+    # Bedlet physical wiring map: grid (row, col) -> MODBUS register index (0-based)
+    # From Prusa modular_bed.cpp line 344 (values are 1-indexed there, we subtract 1)
+    # Row 0 = front (Y=0..90), Row 3 = back (Y=270..360)
+    # Col 0 = left (X=0..90), Col 3 = right (X=270..360)
+    BEDLET_MAP = [
+        [6,  7,  8,  9 ],   # Row 0 (front, Y 0-90)
+        [5,  4,  11, 10],   # Row 1 (Y 90-180)
+        [2,  3,  12, 13],   # Row 2 (Y 180-270)
+        [1,  0,  15, 14],   # Row 3 (back, Y 270-360)
+    ]
+    # Reverse map: MODBUS register index -> (col, row)
+    BEDLET_GRID = {}
+    for _row in range(4):
+        for _col in range(4):
+            BEDLET_GRID[BEDLET_MAP[_row][_col]] = (_col, _row)
+    BEDLET_SIZE = 90  # mm per bedlet (Prusa: X_HBL_SIZE = Y_HBL_SIZE = 90)
 
     # Dwarf fault status register (from Prusa dwarf_registers.hpp)
     DWARF_REG_FAULT_STATUS = 0x8060  # Input register: fault_status
@@ -1671,6 +1689,14 @@ class PuppyBootloader:
         self.bed_modbus_min_interval = 0.1  # Minimum seconds between bed commands
         self.bed_faults_cleared = False  # Track if we've cleared faults since boot
 
+        # Adaptive bed heating state (Prusa modular_bed.cpp)
+        self.bed_enabled_mask = 0xFFFF       # 16-bit mask, all enabled by default
+        self.bed_print_area = None           # (x0, y0, x1, y1) or None = whole bed
+        self.bed_global_target = 0.0         # The "logical" bed target temp
+        self.bed_gradient_cutoff = 2.0       # Prusa default (bedlet units)
+        self.bed_gradient_exponent = 2.0     # Prusa default
+        self.bed_expand_to_sides = True      # Prusa default
+
         # Tool offsets from calibration (relative to T0)
         # Format: {tool_num: (x_offset, y_offset, z_offset)}
         # Loaded from file on startup, saved after calibration
@@ -1786,6 +1812,11 @@ class PuppyBootloader:
             desc="Set individual bedlet temperature")
         self.gcode.register_command("SET_DWARF_TEMP", self.cmd_SET_DWARF_TEMP,
             desc="Set Dwarf heater temperature directly")
+        # Adaptive bed heating commands
+        self.gcode.register_command("SET_BED_AREA", self.cmd_SET_BED_AREA,
+            desc="Set print area for adaptive bed heating")
+        self.gcode.register_command("CLEAR_BED_AREA", self.cmd_CLEAR_BED_AREA,
+            desc="Reset to full bed heating")
 
         # Prusa XL slicer compatibility commands
         self.gcode.register_command("M151", self.cmd_M151,
@@ -5111,6 +5142,145 @@ class PuppyBootloader:
             return True
         return False
 
+    # =========================================================================
+    # ADAPTIVE BED HEATING (Prusa modular_bed.cpp port)
+    # =========================================================================
+
+    def _compute_enabled_mask(self, x0, y0, x1, y1):
+        """Compute 16-bit bedlet enabled mask from print area bounding box.
+        A bedlet is enabled if its 90x90mm rect intersects the print area.
+        Matches Prusa print_area.cpp set_bounding_rect()."""
+        mask = 0
+        for row in range(4):
+            for col in range(4):
+                bx0 = col * self.BEDLET_SIZE
+                by0 = row * self.BEDLET_SIZE
+                bx1 = (col + 1) * self.BEDLET_SIZE
+                by1 = (row + 1) * self.BEDLET_SIZE
+                # Intersection check
+                ix0 = max(x0, bx0)
+                iy0 = max(y0, by0)
+                ix1 = min(x1, bx1)
+                iy1 = min(y1, by1)
+                if ix1 > ix0 and iy1 > iy0:
+                    phys_idx = self.BEDLET_MAP[row][col]
+                    mask |= (1 << phys_idx)
+        return mask
+
+    def _touch_side(self, enabled_mask, dim, sign):
+        """Calculate cost to expand enabled area to one edge.
+        dim: 0=X (columns), 1=Y (rows). sign: +1 or -1.
+        Matches Prusa modular_bed.cpp touch_side().
+        Returns (cost, enable_mask)."""
+        min_cost = 999
+        min_to_enable = 0
+        for col in range(4):
+            for row in range(4):
+                phys = self.BEDLET_MAP[row][col]
+                if not (enabled_mask & (1 << phys)):
+                    continue
+                cost = 0
+                to_enable = 0
+                i = col if dim == 0 else row
+                while True:
+                    i += sign
+                    if 0 <= i < 4:
+                        cost += 1
+                        r = row if dim == 0 else i
+                        c = i if dim == 0 else col
+                        to_enable |= (1 << self.BEDLET_MAP[r][c])
+                    else:
+                        break
+                if cost < min_cost:
+                    min_cost = cost
+                    min_to_enable = to_enable
+        return (min_cost, min_to_enable)
+
+    def _expand_to_sides(self, enabled_mask, target_temp):
+        """Expand enabled bedlets toward 2 nearest edges (anti-warp).
+        Matches Prusa modular_bed.cpp expand_to_sides().
+        Returns new enabled_mask with side bedlets added."""
+        sides = [
+            self._touch_side(enabled_mask, 0, 1),   # right (+X)
+            self._touch_side(enabled_mask, 0, -1),  # left (-X)
+            self._touch_side(enabled_mask, 1, 1),   # back (+Y)
+            self._touch_side(enabled_mask, 1, -1),  # front (-Y)
+        ]
+        sides.sort(key=lambda x: x[0])
+        # Enable toward 2 cheapest sides
+        expand_mask = sides[0][1] | sides[1][1]
+        return enabled_mask | expand_mask
+
+    def _compute_gradient_temps(self, enabled_mask, target_temp):
+        """Compute per-bedlet target temps with gradient for non-enabled bedlets.
+        Matches Prusa modular_bed.cpp update_gradients().
+        Returns dict {physical_idx: temp_celsius} for all 16 bedlets."""
+        import math
+        temps = {}
+        # Enabled bedlets get full target
+        for i in range(16):
+            if enabled_mask & (1 << i):
+                temps[i] = target_temp
+            else:
+                temps[i] = 0.0
+        # Gradient: for each non-enabled bedlet, find nearest enabled
+        cutoff = self.bed_gradient_cutoff
+        exponent = self.bed_gradient_exponent
+        for i in range(16):
+            if enabled_mask & (1 << i):
+                continue
+            col1, row1 = self.BEDLET_GRID[i]
+            for j in range(16):
+                if not (enabled_mask & (1 << j)):
+                    continue
+                col2, row2 = self.BEDLET_GRID[j]
+                dist = math.sqrt((col1 - col2)**2 + (row1 - row2)**2)
+                if dist > cutoff:
+                    continue
+                grad_temp = target_temp - target_temp * ((dist / cutoff) ** exponent)
+                if grad_temp > temps[i]:
+                    temps[i] = grad_temp
+        return temps
+
+    def _apply_adaptive_heating(self, target_temp):
+        """Full adaptive bed pipeline: mask -> expand -> gradient -> write.
+        Called from M140/M190 when bed_print_area is set."""
+        if target_temp <= 0:
+            # Turning off - zero all bedlets
+            self.bed_global_target = 0.0
+            return self._set_bedlet_temperatures(0.0)
+
+        self.bed_global_target = target_temp
+
+        # Compute enabled mask from stored print area
+        if self.bed_print_area is None:
+            # No area set - heat all bedlets uniformly
+            return self._set_bedlet_temperatures(target_temp)
+
+        x0, y0, x1, y1 = self.bed_print_area
+        enabled_mask = self._compute_enabled_mask(x0, y0, x1, y1)
+
+        # Expand to sides (anti-warp)
+        if self.bed_expand_to_sides:
+            enabled_mask = self._expand_to_sides(enabled_mask, target_temp)
+
+        self.bed_enabled_mask = enabled_mask
+
+        # Compute gradient temps
+        temps = self._compute_gradient_temps(enabled_mask, target_temp)
+
+        # Host-side safety: clamp any temp > 120C
+        for idx in temps:
+            if temps[idx] > 120.0:
+                logging.warning(f"PuppyBootloader: Clamping bedlet {idx} from {temps[idx]}C to 120C")
+                temps[idx] = 120.0
+
+        enabled_count = bin(enabled_mask).count('1')
+        logging.info(f"PuppyBootloader: Adaptive bed: {enabled_count}/16 enabled, "
+                     f"target={target_temp}C, area=({x0},{y0})-({x1},{y1})")
+
+        return self._set_bedlet_temperatures(temps)
+
     def _read_discrete_inputs(self, dwarf, start_addr, count):
         """Read discrete inputs (FC 0x02) from Dwarf, returns list of booleans"""
         addr = self.ADDR_MODBUS_OFFSET + dwarf  # Dwarf N at 0x1A + N
@@ -6201,15 +6371,14 @@ class PuppyBootloader:
         if not self.tool_picked or self.active_tool < 0:
             raise gcmd.error("No tool is currently picked!")
 
-        # Homing check - axes must be homed before tool change
+        # Auto-home if needed before tool change
         toolhead = self.printer.lookup_object('toolhead')
         curtime = self.reactor.monotonic()
         kin_status = toolhead.get_status(curtime)
         homed = kin_status.get('homed_axes', '')
-        if 'x' not in homed or 'y' not in homed:
-            raise gcmd.error("X and Y must be homed before TOOL_PARK!")
-        if 'z' not in homed:
-            raise gcmd.error("Z must be homed before TOOL_PARK!")
+        if 'x' not in homed or 'y' not in homed or 'z' not in homed:
+            self.gcode.respond_info("Axes not homed - homing all first...")
+            self.gcode.run_script_from_command("G28")
 
         # Z safety check - ensure bed is at safe height before tool change
         cur_pos = toolhead.get_position()
@@ -6443,11 +6612,11 @@ class PuppyBootloader:
             raise gcmd.error(f"Failed to turn off fan on Dwarf {dwarf}")
 
     def cmd_M140(self, gcmd):
-        """M140 S<temp> - Set bed temperature (all bedlets)
+        """M140 S<temp> - Set bed temperature
 
-        M140 S60       - Set all 16 bedlets to 60C
-        M140 S60 B5    - Set only bedlet 5 to 60C (others unchanged)
-        M140 S0        - Turn off all bedlets
+        M140 S60       - Set bed to 60C (adaptive if bed area set, else all 16)
+        M140 S60 B5    - Set only bedlet 5 to 60C (manual override, ignores adaptive)
+        M140 S0        - Turn off all bedlets and reset adaptive target
         """
         target = gcmd.get_float('S', 0)
         bedlet = gcmd.get_int('B', -1)  # Optional: specific bedlet (0-15)
@@ -6456,19 +6625,31 @@ class PuppyBootloader:
             self.gcode.respond_info("Modular bed not available")
             return
 
+        # Host-side safety: reject > 120C
+        if target > 120.0:
+            raise gcmd.error(f"Target {target}C exceeds bed max (120C)")
+
         if bedlet >= 0:
-            # Set single bedlet
+            # Manual single bedlet override (bypass adaptive)
             if bedlet >= self.NUM_BEDLETS:
                 raise gcmd.error(f"Bedlet {bedlet} invalid (0-{self.NUM_BEDLETS-1})")
-            # Read current targets, modify one
             current = dict(self.bed_target_temps)
             current[bedlet] = target
             if self._set_bedlet_temperatures(current):
                 self.gcode.respond_info(f"Bedlet {bedlet} target: {target}C")
             else:
                 raise gcmd.error(f"Failed to set bedlet {bedlet} temperature")
+        elif self.bed_print_area is not None:
+            # Adaptive mode: distribute temps based on print area
+            if self._apply_adaptive_heating(target):
+                enabled_count = bin(self.bed_enabled_mask).count('1')
+                self.gcode.respond_info(
+                    f"Bed target: {target}C (adaptive: {enabled_count}/16 bedlets)")
+            else:
+                raise gcmd.error("Failed to set bed temperature")
         else:
-            # Set all bedlets
+            # No area set - heat all bedlets uniformly (default behavior)
+            self.bed_global_target = target
             if self._set_bedlet_temperatures(target):
                 self.gcode.respond_info(f"Bed target: {target}C (all 16 bedlets)")
             else:
@@ -6477,8 +6658,8 @@ class PuppyBootloader:
     def cmd_M190(self, gcmd):
         """M190 S<temp> - Set bed temperature and wait
 
-        M190 S60       - Set all bedlets to 60C and wait until reached
-        M190 S60 B5    - Set bedlet 5 to 60C and wait (ignores other bedlets)
+        M190 S60       - Set bed to 60C and wait (adaptive if bed area set)
+        M190 S60 B5    - Set bedlet 5 to 60C and wait (manual override)
         """
         target = gcmd.get_float('S', 0)
         bedlet = gcmd.get_int('B', -1)
@@ -6487,7 +6668,11 @@ class PuppyBootloader:
             self.gcode.respond_info("Modular bed not available")
             return
 
-        # Set the temperature first
+        # Host-side safety: reject > 120C
+        if target > 120.0:
+            raise gcmd.error(f"Target {target}C exceeds bed max (120C)")
+
+        # Set the temperature first (same logic as M140)
         if bedlet >= 0:
             if bedlet >= self.NUM_BEDLETS:
                 raise gcmd.error(f"Bedlet {bedlet} invalid (0-{self.NUM_BEDLETS-1})")
@@ -6496,7 +6681,14 @@ class PuppyBootloader:
             if not self._set_bedlet_temperatures(current):
                 raise gcmd.error(f"Failed to set bedlet {bedlet} temperature")
             self.gcode.respond_info(f"Waiting for bedlet {bedlet} to reach {target}C...")
+        elif self.bed_print_area is not None:
+            if not self._apply_adaptive_heating(target):
+                raise gcmd.error("Failed to set bed temperature")
+            enabled_count = bin(self.bed_enabled_mask).count('1')
+            self.gcode.respond_info(
+                f"Waiting for bed to reach {target}C (adaptive: {enabled_count}/16)...")
         else:
+            self.bed_global_target = target
             if not self._set_bedlet_temperatures(target):
                 raise gcmd.error("Failed to set bed temperature")
             self.gcode.respond_info(f"Waiting for bed to reach {target}C...")
@@ -6522,10 +6714,13 @@ class PuppyBootloader:
                     self.gcode.respond_info(f"Bedlet {bedlet} at {temps[bedlet]:.1f}C")
                     break
             else:
-                # Check all bedlets (average must be within tolerance)
-                avg = sum(temps.values()) / len(temps) if temps else 0
+                # Average only ENABLED bedlets (matches Prusa updateModularBedTemperature)
+                mask = self.bed_enabled_mask
+                enabled_temps = [temps[i] for i in range(16)
+                                 if (mask & (1 << i)) and i in temps]
+                avg = sum(enabled_temps) / len(enabled_temps) if enabled_temps else 0
                 if target == 0 or abs(avg - target) <= tolerance:
-                    self.gcode.respond_info(f"Bed at {avg:.1f}C average")
+                    self.gcode.respond_info(f"Bed at {avg:.1f}C (enabled avg)")
                     break
 
             # Timeout check
@@ -6535,14 +6730,8 @@ class PuppyBootloader:
             self.reactor.pause(self.reactor.monotonic() + 2.0)
 
     def cmd_BED_STATUS(self, gcmd):
-        """Show modular bed status with individual bedlet temperatures
-
-        Displays 4x4 grid of bedlet temperatures:
-          [ 0] [ 1] [ 2] [ 3]
-          [ 4] [ 5] [ 6] [ 7]
-          [ 8] [ 9] [10] [11]
-          [12] [13] [14] [15]
-        """
+        """Show modular bed status with physical grid layout and adaptive state.
+        Uses Prusa bedlet wiring map for correct physical positions."""
         if not self.modular_bed_booted:
             self.gcode.respond_info("Modular bed not booted")
             return
@@ -6554,23 +6743,49 @@ class PuppyBootloader:
 
         # Update local tracking
         self.bed_measured_temps = temps
+        mask = self.bed_enabled_mask
 
-        lines = [f"Modular bed at 0x{self.ADDR_MODULAR_BED:02X}:"]
+        # Header with mode info
+        if self.bed_print_area is not None:
+            x0, y0, x1, y1 = self.bed_print_area
+            enabled_count = bin(mask).count('1')
+            lines = [f"Modular bed [ADAPTIVE] area=({x0:.0f},{y0:.0f})-({x1:.0f},{y1:.0f}) "
+                     f"{enabled_count}/16 enabled:"]
+        else:
+            lines = ["Modular bed [FULL] all 16 bedlets:"]
 
-        # Display as 4x4 grid
+        # Display using Prusa physical wiring map
+        lines.append("  Measured temps (physical grid, * = enabled):")
+        lines.append("           Col0     Col1     Col2     Col3")
         for row in range(4):
-            row_str = "  "
+            y_lo = row * 90
+            y_hi = (row + 1) * 90
+            row_str = f"  Y{y_lo:3d}-{y_hi:3d}"
             for col in range(4):
-                idx = row * 4 + col
-                temp = temps.get(idx, 0)
-                target = self.bed_target_temps.get(idx, 0)
-                row_str += f"[{idx:2d}]{temp:5.1f}C "
+                phys = self.BEDLET_MAP[row][col]
+                temp = temps.get(phys, 0)
+                mark = "*" if (mask & (1 << phys)) else " "
+                row_str += f" {temp:5.1f}{mark} "
             lines.append(row_str)
 
-        # Show average and target
-        avg = sum(temps.values()) / len(temps) if temps else 0
-        avg_target = sum(self.bed_target_temps.values()) / len(self.bed_target_temps) if self.bed_target_temps else 0
-        lines.append(f"  Average: {avg:.1f}C (target: {avg_target:.1f}C)")
+        # Target temps grid
+        if self.bed_global_target > 0:
+            lines.append("  Target temps:")
+            for row in range(4):
+                row_str = "          "
+                for col in range(4):
+                    phys = self.BEDLET_MAP[row][col]
+                    tgt = self.bed_target_temps.get(phys, 0)
+                    row_str += f" {tgt:5.1f}  "
+                lines.append(row_str)
+
+        # Averages
+        enabled_temps = [temps[i] for i in range(16)
+                         if (mask & (1 << i)) and i in temps]
+        all_avg = sum(temps.values()) / len(temps) if temps else 0
+        en_avg = sum(enabled_temps) / len(enabled_temps) if enabled_temps else 0
+        lines.append(f"  Enabled avg: {en_avg:.1f}C  All avg: {all_avg:.1f}C  "
+                     f"Target: {self.bed_global_target:.0f}C")
 
         self.gcode.respond_info("\n".join(lines))
 
@@ -6638,6 +6853,77 @@ class PuppyBootloader:
         lines.append(f"\n5. Fault cleared flag: {self.bed_faults_cleared}")
 
         self.gcode.respond_info("\n".join(lines))
+
+    def cmd_SET_BED_AREA(self, gcmd):
+        """SET_BED_AREA X0=<f> Y0=<f> X1=<f> Y1=<f> - Set print area for adaptive bed heating
+
+        Computes which bedlets overlap the print area and enables adaptive heating.
+        Subsequent M140/M190 commands will heat only the relevant bedlets with gradient.
+        Matches Prusa M555 + modular_bed.cpp behavior.
+
+        SET_BED_AREA X0=30 Y0=30 X1=200 Y1=200
+        """
+        if not self.modular_bed_booted:
+            self.gcode.respond_info("Modular bed not available")
+            return
+
+        x0 = gcmd.get_float('X0', 0.0)
+        y0 = gcmd.get_float('Y0', 0.0)
+        x1 = gcmd.get_float('X1', 360.0)
+        y1 = gcmd.get_float('Y1', 360.0)
+
+        # Clamp to bed bounds
+        x0 = max(0.0, min(360.0, x0))
+        y0 = max(0.0, min(360.0, y0))
+        x1 = max(0.0, min(360.0, x1))
+        y1 = max(0.0, min(360.0, y1))
+
+        if x1 <= x0 or y1 <= y0:
+            raise gcmd.error(f"Invalid bed area: ({x0},{y0})-({x1},{y1})")
+
+        self.bed_print_area = (x0, y0, x1, y1)
+
+        # Compute mask
+        enabled_mask = self._compute_enabled_mask(x0, y0, x1, y1)
+        if self.bed_expand_to_sides:
+            enabled_mask = self._expand_to_sides(enabled_mask, self.bed_global_target)
+        self.bed_enabled_mask = enabled_mask
+
+        # If bed is currently heating, reapply with adaptive temps
+        if self.bed_global_target > 0:
+            self._apply_adaptive_heating(self.bed_global_target)
+
+        enabled_count = bin(enabled_mask).count('1')
+
+        # Show grid
+        lines = [f"Bed area: ({x0:.0f},{y0:.0f})-({x1:.0f},{y1:.0f}), "
+                 f"{enabled_count}/16 bedlets enabled"]
+        lines.append("  Bedlet grid (* = enabled):")
+        for row in range(4):
+            row_str = "    "
+            for col in range(4):
+                phys = self.BEDLET_MAP[row][col]
+                mark = "*" if (enabled_mask & (1 << phys)) else "."
+                row_str += f" {mark} "
+            y_lo = row * 90
+            y_hi = (row + 1) * 90
+            lines.append(f"  Y{y_lo:3d}-{y_hi:3d}: {row_str}")
+        self.gcode.respond_info("\n".join(lines))
+
+    def cmd_CLEAR_BED_AREA(self, gcmd):
+        """CLEAR_BED_AREA - Reset to full bed heating (all 16 bedlets)
+
+        Called by END_PRINT and CANCEL_PRINT to restore default behavior.
+        """
+        self.bed_print_area = None
+        self.bed_enabled_mask = 0xFFFF
+
+        # If bed is currently heating, rewrite all bedlets to global target
+        if self.bed_global_target > 0:
+            self._set_bedlet_temperatures(self.bed_global_target)
+            self.gcode.respond_info(f"Bed area cleared - all 16 bedlets at {self.bed_global_target}C")
+        else:
+            self.gcode.respond_info("Bed area cleared - full bed mode")
 
     def cmd_SET_BEDLET_TEMP(self, gcmd):
         """SET_BEDLET_TEMP BEDLET=<0-15> TEMP=<celsius>
@@ -7239,7 +7525,18 @@ class ModularBedAvgSensor:
     def _sample_temperature(self, eventtime):
         if self._puppy is not None:
             temps = self._puppy.bed_measured_temps
-            if temps:
+            mask = self._puppy.bed_enabled_mask
+            if temps and mask:
+                # Average only enabled bedlets (matches Prusa updateModularBedTemperature)
+                enabled_temps = [temps[i] for i in range(16)
+                                 if (mask & (1 << i)) and i in temps]
+                if enabled_temps:
+                    self.temp = sum(enabled_temps) / len(enabled_temps)
+                elif temps:
+                    self.temp = sum(temps.values()) / len(temps)
+                else:
+                    self.temp = 0.0
+            elif temps:
                 self.temp = sum(temps.values()) / len(temps)
             else:
                 self.temp = 0.0
@@ -7251,10 +7548,10 @@ class ModularBedAvgSensor:
         return eventtime + 1.0
 
     def get_status(self, eventtime):
-        # Include target temp from bed_target_temps if available
+        # Report the global bed target (what the user asked for), not avg of all 16
         target = 0.0
-        if self._puppy is not None and self._puppy.bed_target_temps:
-            target = sum(self._puppy.bed_target_temps.values()) / len(self._puppy.bed_target_temps)
+        if self._puppy is not None:
+            target = self._puppy.bed_global_target
         return {
             'temperature': round(self.temp, 1),
             'target': round(target, 1)

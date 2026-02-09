@@ -2,7 +2,7 @@
 
 Complete step-by-step guide to install XlKlipper on a Prusa XL with XLBuddy board.
 
-**Last Updated:** 2026-02-06
+**Last Updated:** 2026-02-09
 **Tested Configuration:** Prusa XL 5-tool with XLBuddy mainboard
 
 ---
@@ -712,21 +712,44 @@ Verify temperatures in Mainsail match expectations.
 
 ## Quick Reference Commands
 
+### Tool & Motion
 | Command | Description |
 |---------|-------------|
 | `G28 X Y` | Home X/Y (sensorless) |
 | `G28 Z` | Home Z (loadcell, needs tool picked) |
-| `T0`-`T4` | Select tool |
+| `T0`-`T4` | Select tool (automatic park/pick) |
 | `TOOL_PICK T=n` | Pick specific tool |
 | `TOOL_PARK` | Park current tool |
-| `M104 Tn Sxxx` | Set tool n temperature |
 | `PRUSA_Z_LEVEL` | Crash-based Z alignment |
 | `CALIBRATE_TOOL_OFFSETS` | Full tool offset calibration |
-| `DWARF_STATUS` | Show all Dwarf temperatures |
-| `BED_STATUS` | Show modular bed temperatures |
-| `SHOW_THRESHOLDS` | Show probe threshold settings |
 | `SHOW_TOOL_OFFSETS` | Show calibrated tool offsets |
+
+### Heaters & Bed
+| Command | Description |
+|---------|-------------|
+| `M104 Tn Sxxx` | Set tool n temperature |
+| `SET_DWARF_TEMP DWARF=n TEMP=x` | Set individual tool temperature |
+| `DWARF_STATUS` | Show all Dwarf temperatures |
+| `BED_STATUS` | Show 4x4 bedlet temperature grid |
+| `SET_BED_AREA X0= Y0= X1= Y1=` | Set adaptive bed heating zone |
+| `CLEAR_BED_AREA` | Reset to full bed heating |
+
+### Filament & Spool Join
+| Command | Description |
+|---------|-------------|
+| `SPOOL_JOIN TO=n` | Remap current tool to physical tool n |
+| `SPOOL_JOIN_STATUS` | Show active spool join remaps |
+| `SPOOL_JOIN_RESET` | Clear all spool join remaps |
+
+### Probe Thresholds
+| Command | Description |
+|---------|-------------|
+| `SHOW_THRESHOLDS` | Show current probe threshold settings |
+| `SET_Z_FAST VALUE=x` | Set Z fast probe threshold (default: 125g) |
+| `SET_Z_SLOW VALUE=x` | Set Z slow probe threshold (default: 125g) |
+| `SET_MESH VALUE=x` | Set bed mesh probe threshold (default: 125g) |
+| `SET_XY VALUE=x` | Set XY calibration threshold (default: 40g) |
 
 ---
 
-*Guide updated 2026-02-06 for XlKlipper project*
+*Guide updated 2026-02-09 for XlKlipper project*
