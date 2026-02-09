@@ -42,6 +42,7 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 ### Interface & Monitoring
 - **Side LED Strips** - Status effects for idle, printing, heating, paused, error, and complete states
 - **Modular Bed Monitoring** - `BED_STATUS` command shows 4x4 bedlet temperature grid with physical wiring map
+- **Bedlet Grid Panel** - Live 4x4 temperature heatmap embedded in Mainsail dashboard via HTML Iframe (color-coded, auto-detect host)
 - **Webcam Integration** - USB camera support via Crowsnest
 - **OrcaSlicer Ready** - Pre-configured profile and macros included
 
