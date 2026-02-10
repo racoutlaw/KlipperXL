@@ -1156,20 +1156,24 @@ class LoadcellProbe:
         self._puppy.reactor.pause(self._puppy.reactor.monotonic() + wait_time)
 
         # === STEP 6: Wait for nozzles to reach calibration temp ===
-        gcmd.respond_info("=== STEP 6: HEATING TO CALIBRATION TEMP ===")
-        gcmd.respond_info("Heating nozzles to %.0fC for calibration..." % cal_temp)
+        gcmd.respond_info("=== STEP 6: WAITING FOR CALIBRATION TEMP ===")
+        gcmd.respond_info("Setting nozzles to %.0fC for calibration..." % cal_temp)
 
         for tool_num in tool_list:
             dwarf_num = tool_num + 1
             gcode.run_script_from_command("SET_DWARF_TEMP DWARF=%d TEMP=%.0f" % (dwarf_num, cal_temp))
 
-        # Wait for temps to stabilize
+        # Wait for temps to reach cal_temp (heat up OR cool down)
         for tool_num in tool_list:
             dwarf_num = tool_num + 1
-            gcmd.respond_info("Waiting for T%d to reach %.0fC..." % (tool_num, cal_temp))
+            temp = self._puppy.dwarf_data.get(dwarf_num, {}).get('hotend_temp', 0)
+            if temp > cal_temp + 5:
+                gcmd.respond_info("T%d at %.0fC - waiting to cool to %.0fC..." % (tool_num, temp, cal_temp))
+            else:
+                gcmd.respond_info("Waiting for T%d to reach %.0fC..." % (tool_num, cal_temp))
             while True:
                 temp = self._puppy.dwarf_data.get(dwarf_num, {}).get('hotend_temp', 0)
-                if temp >= cal_temp - 5:
+                if cal_temp - 5 <= temp <= cal_temp + 5:
                     break
                 self._puppy.reactor.pause(self._puppy.reactor.monotonic() + 1.0)
 
