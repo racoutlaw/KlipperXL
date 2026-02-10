@@ -498,27 +498,30 @@ class LoadcellProbe:
                 offset = result.get('offset', 0)
                 offset_g = offset * self._puppy.LOADCELL_SCALE
 
-                # Check deviation from reference (Prusa: max_tare_offset = 125g)
+                # Check deviation from reference (Prusa probe.cpp style)
+                # Prusa: re-tare each point, compare to reference.
+                # If offset > threshold: lift, re-tare, update reference, continue.
+                # Our MODBUS loadcell drifts thermally more than Prusa's direct
+                # connection, so we update the reference on every point to track
+                # the drift, and only lift for extreme deviations (>500g).
                 if self._reference_tare is not None:
                     deviation = abs(offset - self._reference_tare) * self._puppy.LOADCELL_SCALE
-                    if deviation > self._max_tare_deviation:
-                        logging.warning(f"LoadcellProbe: Tare deviation {deviation:.1f}g > {self._max_tare_deviation}g limit!")
-                        logging.info("LoadcellProbe: Lifting and re-establishing baseline...")
-                        # Lift bed 20mm (Z_AFTER_PROBING equivalent)
+                    if deviation > 500.0:
+                        # Extreme deviation - lift and re-tare (Prusa Z_AFTER_PROBING)
+                        logging.warning(f"LoadcellProbe: Tare deviation {deviation:.1f}g - lifting to re-establish baseline")
                         toolhead = self._printer.lookup_object('toolhead')
                         curpos = toolhead.get_position()
-                        toolhead.manual_move([None, None, curpos[2] + 20.0], 10.0)  # 10mm/s
+                        toolhead.manual_move([None, None, curpos[2] + 20.0], 10.0)
                         toolhead.wait_moves()
-                        # Settle and re-tare to establish new baseline
                         self._puppy.reactor.pause(self._puppy.reactor.monotonic() + 0.3)
                         result = self._puppy.tare_mcu_cmd.send([modbus_addr, 48])
                         offset = result.get('offset', 0)
-                        self._reference_tare = offset  # New baseline
                         offset_g = offset * self._puppy.LOADCELL_SCALE
                         logging.info(f"LoadcellProbe: New reference tare={offset} ({offset_g:.1f}g)")
-                        # Move back down to probe position (will be done by bed_mesh)
                     else:
-                        logging.info(f"LoadcellProbe: Mesh tare={offset} ({offset_g:.1f}g), deviation={deviation:.1f}g OK")
+                        logging.info(f"LoadcellProbe: Mesh tare={offset} ({offset_g:.1f}g), drift={deviation:.1f}g")
+                    # Always update reference to track thermal drift (Prusa line 633)
+                    self._reference_tare = offset
                 else:
                     logging.info(f"LoadcellProbe: Mesh tare={offset} ({offset_g:.1f}g)")
 
