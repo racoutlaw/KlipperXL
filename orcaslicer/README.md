@@ -20,7 +20,7 @@ The import overrides these Generic Tool Changer settings to match the Prusa XL r
 | Print height | 360mm |
 | G-code flavor | Klipper |
 | Nozzle type | Hardened steel |
-| Z offset | 0.035 |
+| Z offset | 0 (tuned per-tool in Klipper, see main README) |
 | Max speed X/Y | 400 mm/s |
 | Max speed Z | 12 mm/s |
 | Max accel X/Y | 1800 mm/s² |

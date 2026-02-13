@@ -1685,6 +1685,7 @@ class PuppyBootloader:
         self.led_pending = set()  # Dwarfs needing cheese LED config retry
         self.tool_remap = {}  # {gcode_tool: physical_tool} for spool join
         self._button_extrude_active = False  # True while button-driven extrude is in progress
+        self._pending_offset_tool = None  # Tool needing offset applied after ready
 
         # Heater sync state - syncs [extruder] heater target to MODBUS
         self._extruder_heater = None  # Reference to [extruder] heater object
@@ -1807,6 +1808,7 @@ class PuppyBootloader:
         self._m104_overridden = False
         self.printer.register_event_handler("klippy:ready", self._override_m104_m109)
         self.printer.register_event_handler("klippy:ready", self._override_turn_off_heaters)
+        self.printer.register_event_handler("klippy:ready", self._apply_pending_offset)
         self.gcode.register_command("M106", self.cmd_M106,
             desc="Set fan speed")
         self.gcode.register_command("M107", self.cmd_M107,
@@ -3565,17 +3567,12 @@ class PuppyBootloader:
                             self.tmc_enabled[dwarf] = True
                             self._write_coil(dwarf, 0x4001, True)  # select it
                             logging.info(f"PuppyBootloader: T{tool} TMC enabled successfully")
-                            # Apply tool offset on auto-detect
-                            offset = self.tool_offsets.get(tool, (0.0, 0.0, 0.0))
-                            ox, oy, oz = offset
-                            # Negate offsets for Klipper's SET_GCODE_OFFSET
-                            # Prusa stores offset = ref_center - tool_center (Marlin convention)
-                            # Marlin applies by shifting current_position += offset (no persistent shift)
-                            # Klipper's SET_GCODE_OFFSET adds to ALL future gcode positions
-                            # These have opposite effects, so we negate when applying
-                            self.gcode.run_script_from_command(f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={-oz:.4f} MOVE=0")
-                            self.applied_tool_offset = offset
-                            logging.info(f"PuppyBootloader: Applied T{tool} offset on auto-detect: X={-ox:.4f} Y={-oy:.4f} Z={-oz:.4f} (stored: {ox:.4f},{oy:.4f},{oz:.4f})")
+                            # Defer offset application until printer is ready.
+                            # SET_GCODE_OFFSET fails during boot ("Printer is not ready").
+                            # The offset will be applied by _apply_pending_offset()
+                            # which is called from the klippy:ready event handler.
+                            self._pending_offset_tool = tool
+                            logging.info(f"PuppyBootloader: T{tool} offset deferred until printer ready")
                         else:
                             logging.warning(f"PuppyBootloader: T{tool} TMC enable failed - "
                                             f"tool detected but extruder motion disabled")
@@ -4721,6 +4718,18 @@ class PuppyBootloader:
             else:
                 # Full physical tool change
                 if self.active_tool == physical_tool and self.tool_picked:
+                    # Still apply offsets - they may not have been applied
+                    # after a restart (auto-detect fails before printer ready)
+                    offset = self.tool_offsets.get(physical_tool, (0.0, 0.0, 0.0))
+                    ox, oy, oz = offset
+                    tool_z_adj = 0.0
+                    tool_offsets_mod = self.printer.lookup_object('tool_offsets', None)
+                    if tool_offsets_mod is not None:
+                        tool_z_adj = tool_offsets_mod.get_z_offset(physical_tool)
+                    total_z = -oz + tool_z_adj
+                    self.gcode.run_script_from_command(
+                        f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} MOVE=0")
+                    self.applied_tool_offset = offset
                     self.gcode.respond_info(
                         f"T{physical_tool} already picked!")
                     return
@@ -5346,6 +5355,10 @@ class PuppyBootloader:
 
     def _move_xy(self, x=None, y=None, speed=None):
         """Move X and/or Y axis via G1 gcode"""
+        # CRITICAL: Enforce absolute mode. If G91 is stuck (e.g. from a failed
+        # macro that never ran RESTORE_GCODE_STATE), dock coordinates would be
+        # interpreted as relative offsets, causing a crash.
+        self.gcode.run_script_from_command("G90")
         cmd = "G1"
         if x is not None:
             cmd += f" X{x:.2f}"
@@ -6265,8 +6278,17 @@ class PuppyBootloader:
         # Marlin applies by shifting current_position += offset (one-time shift)
         # Klipper's SET_GCODE_OFFSET persistently adds to ALL gcode positions
         # These have opposite effects, so we negate when applying to Klipper
+        #
+        # Per-tool z_offset from [tool_offsets] is ADDED directly (slicer convention,
+        # positive = up, no negation needed). This is separate from the calibrated
+        # offset and handles per-tool first-layer fine-tuning.
+        tool_z_adj = 0.0
+        tool_offsets_mod = self.printer.lookup_object('tool_offsets', None)
+        if tool_offsets_mod is not None:
+            tool_z_adj = tool_offsets_mod.get_z_offset(tool)
+        total_z = -oz + tool_z_adj
         self.gcode.run_script_from_command(
-            f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={-oz:.4f} MOVE=0")
+            f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} MOVE=0")
 
         # Update the applied offset tracking (Prusa's hotend_currently_applied_offset)
         self.applied_tool_offset = new_offset
@@ -6422,6 +6444,27 @@ class PuppyBootloader:
         # Prusa also removes tool offsets before parking (hotend_currently_applied_offset).
         self.gcode.run_script_from_command("SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0")
         self.applied_tool_offset = (0.0, 0.0, 0.0)
+
+        # Sanity check: verify toolhead position is within machine limits.
+        # A "Move out of range" error in Klipper corrupts gcode_move.last_position
+        # (updated before the move is validated) without moving the toolhead.
+        # This desync can cause TOOL_PARK to compute wildly wrong targets.
+        # Fix: re-sync gcode_move from the actual toolhead position.
+        toolhead = self.printer.lookup_object('toolhead')
+        cur_pos = toolhead.get_position()
+        max_x = 360.0
+        max_y = 465.0  # Beyond bed (360) to reach docks (~455)
+        if (cur_pos[0] < -10 or cur_pos[0] > max_x or
+                cur_pos[1] < -10 or cur_pos[1] > max_y):
+            self.gcode.respond_info(
+                f"WARNING: Position tracking suspect "
+                f"({cur_pos[0]:.1f}, {cur_pos[1]:.1f}) - re-homing")
+            logging.warning(
+                f"PuppyBootloader: TOOL_PARK position sanity check failed: "
+                f"({cur_pos[0]:.1f}, {cur_pos[1]:.1f}) - forcing G28")
+            self.gcode.run_script_from_command("G28")
+            # Re-check after homing
+            cur_pos = toolhead.get_position()
 
         dock_x = self._get_dock_x(tool)
         dock_y = self._get_dock_y(tool)
@@ -7120,6 +7163,36 @@ class PuppyBootloader:
         s = gcmd.get_float('S', None)
         p = gcmd.get_int('P', None)
         logging.info(f"PuppyBootloader: M302 cold extrusion stub - S={s} P={p}")
+
+    def _apply_pending_offset(self):
+        """Apply deferred tool offset after printer is ready.
+
+        During boot, auto-detect sets _pending_offset_tool but can't run
+        SET_GCODE_OFFSET because the printer isn't ready yet. This handler
+        runs at klippy:ready and applies the offset.
+        """
+        tool = self._pending_offset_tool
+        if tool is None:
+            return
+        self._pending_offset_tool = None
+        offset = self.tool_offsets.get(tool, (0.0, 0.0, 0.0))
+        ox, oy, oz = offset
+        tool_z_adj = 0.0
+        tool_offsets_mod = self.printer.lookup_object('tool_offsets', None)
+        if tool_offsets_mod is not None:
+            tool_z_adj = tool_offsets_mod.get_z_offset(tool)
+        total_z = -oz + tool_z_adj
+        try:
+            self.gcode.run_script_from_command(
+                f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} MOVE=0")
+            self.applied_tool_offset = offset
+            logging.info(
+                f"PuppyBootloader: Applied T{tool} offset (deferred): "
+                f"X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} "
+                f"(cal_z={oz:.4f}, tool_z_adj={tool_z_adj:.4f})")
+        except Exception as e:
+            logging.warning(
+                f"PuppyBootloader: Failed to apply deferred T{tool} offset: {e}")
 
     def _override_m104_m109(self):
         """Override Klipper's M104/M109 commands at klippy:ready time.

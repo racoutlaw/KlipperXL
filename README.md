@@ -34,7 +34,7 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 ### Motion & Calibration
 - **Input Shaper** - Resonance compensation via Dwarf accelerometers (per-tool measurement)
 - **Z Tilt Alignment** - Prusa-matched mechanical bed leveling
-- **Z Offset (Live-Z)** - Adjusted in OrcaSlicer printer profile (z_offset), no firmware babystep needed
+- **Per-Tool Z Offset** - Fine-tune first layer height per tool using Mainsail's built-in Z offset controls, saved to printer.cfg via `[tool_offsets]`
 
 ### Heater Management
 - **Multi-Tool Heater Preservation** - Parked tools maintain temperature via periodic MODBUS refresh
@@ -108,6 +108,47 @@ KlipperXL/
 | `SET_Z_SLOW VALUE=` | Adjust Z slow probe threshold |
 | `SET_MESH VALUE=` | Adjust bed mesh probe threshold |
 | `SET_XY VALUE=` | Adjust XY calibration probe threshold |
+| `GET_TOOL_Z_OFFSETS` | Display per-tool Z offsets |
+| `SET_TOOL_Z_OFFSET TOOL= Z=` | Set Z offset for a tool (in memory) |
+| `SAVE_TOOL_Z_OFFSET TOOL= Z=` | Save Z offset for a tool to config |
+
+## Per-Tool Z Offset
+
+Each tool can have its own Z offset fine-tuning, independent of calibration offsets. This solves the problem where one tool's first layer is perfect but others are too high or too low.
+
+### How It Works
+
+The `[tool_offsets]` section in `printer.cfg` stores a Z offset for each tool:
+
+```ini
+[tool_offsets]
+t0_z_offset: 0.0350
+t1_z_offset: 0.0000
+t2_z_offset: -0.0200
+t3_z_offset: 0.0000
+t4_z_offset: 0.0000
+```
+
+These offsets are automatically combined with the calibrated tool offsets during tool changes. Two independent layers:
+
+1. **Calibration offsets** - Set by `CALIBRATE_TOOL_OFFSETS` (stored in `[puppy_bootloader]`)
+2. **Per-tool Z offsets** - Fine-tuned per tool for first layer (stored in `[tool_offsets]`)
+
+### Tuning Workflow
+
+1. Run `CALIBRATE_TOOL_OFFSETS` to calibrate all tools
+2. Start a first-layer test print with **T0**
+3. Use Mainsail's **Z Offset** section (+/- buttons) to adjust until the first layer looks right
+4. Click the **Save** button in Mainsail's Z Offset section — this saves the value to T0
+5. Click **SAVE_CONFIG** in the top-right to write it to `printer.cfg`
+6. Repeat steps 2-5 for each tool (T1, T2, T3, T4)
+
+### Important Notes
+
+- **Do NOT set z_offset in OrcaSlicer** — leave it at 0. All Z offset tuning is done per-tool in Klipper
+- Mainsail's Save button automatically saves to whichever tool is currently active
+- Safety bounds: -0.3mm to +0.5mm per tool
+- These offsets persist across restarts (stored in `printer.cfg`)
 
 ## OrcaSlicer Setup
 
