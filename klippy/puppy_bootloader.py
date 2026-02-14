@@ -1,4 +1,4 @@
-# XlKlipper - Prusa XL Klipper Integration
+# KlipperXL - Prusa XL Klipper Integration
 # Prusa Puppy Bootloader + MODBUS for Klipper
 # Boots Dwarfs and communicates via MODBUS
 #

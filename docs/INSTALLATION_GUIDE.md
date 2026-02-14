@@ -1,6 +1,6 @@
-# XlKlipper Installation Guide
+# KlipperXL Installation Guide
 
-Complete step-by-step guide to install XlKlipper on a Prusa XL with XLBuddy board.
+Complete step-by-step guide to install KlipperXL on a Prusa XL with XLBuddy board.
 
 **Last Updated:** 2026-02-09
 **Tested Configuration:** Prusa XL 5-tool with XLBuddy mainboard
@@ -11,7 +11,7 @@ Complete step-by-step guide to install XlKlipper on a Prusa XL with XLBuddy boar
 
 1. [Prerequisites](#1-prerequisites)
 2. [Raspberry Pi Setup](#2-raspberry-pi-setup)
-3. [Extract XlKlipper Package](#3-extract-xlklipper-package)
+3. [Extract KlipperXL Package](#3-extract-xlklipper-package)
 4. [Build Klipper MCU Firmware](#4-build-klipper-mcu-firmware)
 5. [Flash XLBuddy MCU](#5-flash-xlbuddy-mcu)
 6. [Deploy Python Modules](#6-deploy-python-modules)
@@ -95,7 +95,7 @@ Example: `<YOUR_PI_IP>`
 
 ---
 
-## 3. Extract XlKlipper Package
+## 3. Extract KlipperXL Package
 
 On your **build computer** (WSL/Linux), not the Pi:
 
@@ -104,8 +104,8 @@ On your **build computer** (WSL/Linux), not the Pi:
 ```bash
 mkdir -p ~/projects
 cd ~/projects
-tar -xzf XlKlipper_Install_Package_20260206.tar.gz
-cd XlKlipper_Install_Package
+tar -xzf KlipperXL_Install_Package_20260206.tar.gz
+cd KlipperXL_Install_Package
 ```
 
 You should see these folders:
@@ -130,7 +130,7 @@ cd klipper
 ### 4.1 Copy Custom Modules to Klipper Source
 
 ```bash
-# From the XlKlipper_Install_Package directory
+# From the KlipperXL_Install_Package directory
 cp mcu_firmware/modbus_stm32f4.c ~/klipper/src/stm32/
 ```
 
@@ -222,7 +222,7 @@ You should see something like: `usb-Klipper_stm32f407xx_...`
 Copy all Python extras to the Pi's Klipper installation:
 
 ```bash
-# From the XlKlipper_Install_Package directory
+# From the KlipperXL_Install_Package directory
 PI_IP="<PI_IP>"  # Change to your Pi's IP
 
 scp python_modules/puppy_bootloader.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
@@ -239,7 +239,7 @@ scp python_modules/modbus_master.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
 ### 7.1 Copy Configuration Files
 
 ```bash
-# From the XlKlipper_Install_Package directory
+# From the KlipperXL_Install_Package directory
 PI_IP="<PI_IP>"  # Change to your Pi's IP
 
 # Main printer.cfg
@@ -286,7 +286,7 @@ sudo systemctl restart klipper
 
 ### The Problem
 
-After deploying XlKlipper files, Moonraker's Update Manager will show Klipper as **"dirty"** because we added custom files to the Klipper git repo. This prevents applying Klipper updates through Mainsail.
+After deploying KlipperXL files, Moonraker's Update Manager will show Klipper as **"dirty"** because we added custom files to the Klipper git repo. This prevents applying Klipper updates through Mainsail.
 
 ### The Fix
 
@@ -536,7 +536,7 @@ G92 E0
 
 ### 10.4 Save as New Profile
 
-Save as a new printer profile (e.g., "XlKlipper 5-Tool") so your changes
+Save as a new printer profile (e.g., "KlipperXL 5-Tool") so your changes
 don't get overwritten by OrcaSlicer updates.
 
 ### 10.5 Alternative: Import Pre-configured Profile
@@ -545,7 +545,7 @@ If you prefer importing a complete profile bundle instead of modifying
 the generic tool changer profile:
 
 1. Go to **File > Import > Import Config Bundle**
-2. Select `XlKlipper_Install_Package/orcaslicer/XlKlipper_Profile.ini`
+2. Select `KlipperXL_Install_Package/orcaslicer/KlipperXL_Profile.ini`
 3. Profiles appear in your printer/print/filament dropdowns
 
 ---
@@ -740,4 +740,4 @@ Verify temperatures in Mainsail match expectations.
 
 ---
 
-*Guide updated 2026-02-09 for XlKlipper project*
+*Guide updated 2026-02-09 for KlipperXL project*

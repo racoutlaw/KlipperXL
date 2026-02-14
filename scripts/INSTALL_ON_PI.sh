@@ -1,5 +1,5 @@
 #!/bin/bash
-# XlKlipper - MODBUS Master Installation Script for Prusa XL
+# KlipperXL - MODBUS Master Installation Script for Prusa XL
 # Copyright (C) 2026 Richard Crook
 #
 # This program is free software: you can redistribute it and/or modify

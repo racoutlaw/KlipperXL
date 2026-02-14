@@ -1,4 +1,4 @@
-# XlKlipper - Dwarf Accelerometer Support for Prusa XL
+# KlipperXL - Dwarf Accelerometer Support for Prusa XL
 # LIS2DH12 accelerometer on each Dwarf toolhead, accessed via MODBUS FIFO
 # Used for input shaper calibration with Klipper resonance_tester
 #

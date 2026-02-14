@@ -1,4 +1,4 @@
-# XlKlipper - Loadcell Probe Module for Prusa XL
+# KlipperXL - Loadcell Probe Module for Prusa XL
 # Copyright (C) 2026 Richard Crook
 #
 # Based on Klipper 3D Printer Firmware

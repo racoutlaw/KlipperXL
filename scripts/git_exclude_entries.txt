@@ -1,4 +1,4 @@
-# XlKlipper custom files - exclude from dirty tracking
+# KlipperXL custom files - exclude from dirty tracking
 # Add these lines to /home/pi/klipper/.git/info/exclude
 klippy/extras/puppy_bootloader.py
 klippy/extras/puppy_bootloader.py.*

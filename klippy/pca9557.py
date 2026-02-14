@@ -1,4 +1,4 @@
-# XlKlipper - PCA9557 I2C GPIO Expander for Prusa XL
+# KlipperXL - PCA9557 I2C GPIO Expander for Prusa XL
 # Releases Dwarf toolheads from reset
 #
 # Copyright (C) 2026 Richard Crook

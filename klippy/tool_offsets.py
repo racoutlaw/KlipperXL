@@ -1,4 +1,4 @@
-# XlKlipper - Per-tool Z offset fine-tuning for multi-tool printers
+# KlipperXL - Per-tool Z offset fine-tuning for multi-tool printers
 #
 # Provides [tool_offsets] config section with per-tool z_offset values.
 # Works with Mainsail's Z-offset +/- buttons and Save button.

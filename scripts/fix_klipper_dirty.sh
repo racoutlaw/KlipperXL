@@ -1,5 +1,5 @@
 #!/bin/bash
-# XlKlipper - Fix Klipper "dirty" in Moonraker Update Manager
+# KlipperXL - Fix Klipper "dirty" in Moonraker Update Manager
 # Copyright (C) 2026 Richard Crook
 #
 # This program is free software: you can redistribute it and/or modify
@@ -7,7 +7,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# Problem: After installing XlKlipper, the Klipper repo shows as "dirty" in
+# Problem: After installing KlipperXL, the Klipper repo shows as "dirty" in
 # Moonraker's Update Manager because we added custom files and modified
 # Makefiles. This prevents Klipper updates from being applied.
 #
@@ -16,7 +16,7 @@
 # 2. Marking modified tracked files as assume-unchanged
 # 3. Clearing Moonraker's cached dirty state
 #
-# Run this ON THE PI after deploying all XlKlipper files.
+# Run this ON THE PI after deploying all KlipperXL files.
 # Usage: bash fix_klipper_dirty.sh
 # =============================================================================
 
@@ -25,7 +25,7 @@ set -e
 KLIPPER_DIR="/home/pi/klipper"
 MOONRAKER_DB="/home/pi/printer_data/database/moonraker-sql.db"
 
-echo "=== XlKlipper: Fixing Klipper dirty state ==="
+echo "=== KlipperXL: Fixing Klipper dirty state ==="
 
 # Step 1: Add custom files to .git/info/exclude
 echo ""
@@ -33,12 +33,12 @@ echo "Step 1: Adding custom files to .git/info/exclude..."
 EXCLUDE_FILE="$KLIPPER_DIR/.git/info/exclude"
 
 # Check if our entries already exist
-if grep -q "XlKlipper custom files" "$EXCLUDE_FILE" 2>/dev/null; then
+if grep -q "KlipperXL custom files" "$EXCLUDE_FILE" 2>/dev/null; then
     echo "  Already configured, skipping."
 else
     cat >> "$EXCLUDE_FILE" << 'EOF'
 
-# XlKlipper custom files - exclude from dirty tracking
+# KlipperXL custom files - exclude from dirty tracking
 klippy/extras/puppy_bootloader.py
 klippy/extras/puppy_bootloader.py.*
 klippy/extras/puppy_bootloader_working_probe.py.bak
