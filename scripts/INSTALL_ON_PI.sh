@@ -25,25 +25,41 @@ echo " Installation Script"
 echo "=========================================="
 echo ""
 
-# Check we're on the Pi
-if [ ! -f /proc/device-tree/model ]; then
-    echo "WARNING: This doesn't appear to be a Raspberry Pi"
-    echo "Continuing anyway..."
+# Prerequisites check - Klipper must be installed via KIAUH first
+MISSING=""
+
+if [ ! -d "$HOME/klipper" ]; then
+    MISSING="$MISSING\n  - ~/klipper (Klipper repo not found)"
 fi
+
+if [ ! -d "$HOME/klippy-env" ]; then
+    MISSING="$MISSING\n  - ~/klippy-env (Klipper Python environment not found)"
+fi
+
+if ! command -v arm-none-eabi-gcc &>/dev/null; then
+    MISSING="$MISSING\n  - arm-none-eabi-gcc (ARM build toolchain not found)"
+fi
+
+if [ ! -f "$HOME/printer_data/config/printer.cfg" ]; then
+    MISSING="$MISSING\n  - ~/printer_data/config/printer.cfg (Klipper not configured)"
+fi
+
+if [ -n "$MISSING" ]; then
+    echo "ERROR: Klipper is not fully installed. Missing:"
+    echo -e "$MISSING"
+    echo ""
+    echo "Install Klipper first using KIAUH:"
+    echo "  git clone https://github.com/dw-0/kiauh.git"
+    echo "  ./kiauh/kiauh.sh"
+    echo ""
+    echo "Install Klipper, Moonraker, and Mainsail, then re-run this script."
+    exit 1
+fi
+
+echo "Klipper installation found, proceeding..."
+echo ""
 
 cd ~
-
-# Step 1: Clone or update Klipper
-echo "[1/5] Setting up Klipper..."
-if [ -d "klipper" ]; then
-    echo "Klipper exists, pulling updates..."
-    cd klipper
-    git pull || true
-    cd ..
-else
-    echo "Cloning Klipper..."
-    git clone https://github.com/Klipper3d/klipper.git
-fi
 
 # Step 2: Copy MODBUS module files
 echo ""
