@@ -1,6 +1,9 @@
 // XlKlipper - MODBUS Master for Prusa XL
 // Copyright (C) 2026 Richard Crook
 //
+// Based on Klipper 3D Printer Firmware
+//   Copyright (C) 2016-2024 Kevin O'Connor <kevin@koconnor.net>
+//
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or

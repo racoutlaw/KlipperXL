@@ -4,6 +4,9 @@
 #
 # Copyright (C) 2026 Richard Crook
 #
+# Based on Klipper 3D Printer Firmware
+#   Copyright (C) 2016-2024 Kevin O'Connor <kevin@koconnor.net>
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
@@ -16,7 +19,6 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-# =============================================================================
 
 import collections
 import logging

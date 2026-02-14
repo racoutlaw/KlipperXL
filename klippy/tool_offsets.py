@@ -1,11 +1,26 @@
-# Per-tool Z offset fine-tuning for multi-tool printers
+# XlKlipper - Per-tool Z offset fine-tuning for multi-tool printers
 #
 # Provides [tool_offsets] config section with per-tool z_offset values.
 # Works with Mainsail's Z-offset +/- buttons and Save button.
 # Integrates with puppy_bootloader.py for tool change offset application.
 #
-# Copyright (C) 2026  XlKlipper Contributors
-# Licensed under the GNU GPLv3
+# Copyright (C) 2026 Richard Crook
+#
+# Based on Klipper 3D Printer Firmware
+#   Copyright (C) 2016-2024 Kevin O'Connor <kevin@koconnor.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 import logging
 
 

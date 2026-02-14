@@ -1,5 +1,12 @@
 #!/bin/bash
-# Klipper MODBUS Master Installation Script for Prusa XL
+# XlKlipper - MODBUS Master Installation Script for Prusa XL
+# Copyright (C) 2026 Richard Crook
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
 # Run this on your Raspberry Pi
 #
 # Usage: ./INSTALL_ON_PI.sh

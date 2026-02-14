@@ -1,7 +1,11 @@
 #!/bin/bash
-# =============================================================================
 # XlKlipper - Fix Klipper "dirty" in Moonraker Update Manager
-# =============================================================================
+# Copyright (C) 2026 Richard Crook
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 #
 # Problem: After installing XlKlipper, the Klipper repo shows as "dirty" in
 # Moonraker's Update Manager because we added custom files and modified

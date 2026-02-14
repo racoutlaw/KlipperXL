@@ -7,6 +7,9 @@ Use this if your XLBuddy is bricked (blank screen, won't boot) after a bad flash
 - `firmware.bin` - Prusa XL stock firmware (noboot version, ~1.8MB)
 - `firmware.bbf` - Resource file (copy to USB drive if XL shows "Looking for BBF")
 
+These binaries are from [Prusa-Firmware-Buddy](https://github.com/prusa3d/Prusa-Firmware-Buddy),
+licensed under GPLv3. Source code is available at: https://github.com/prusa3d/Prusa-Firmware-Buddy
+
 ## Requirements
 
 - Raspberry Pi (or any Linux machine) with `dfu-util` installed
