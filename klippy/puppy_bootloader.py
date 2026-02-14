@@ -1761,13 +1761,13 @@ class PuppyBootloader:
         self.loadcell_last_raw = {}  # {dwarf_num: last_raw_value}
         self.last_probe_z = None     # Last Z probe result
 
-        # Dock positions (can be overridden by DOCK_CALIBRATE)
+        # Dock positions (loaded from config or hardcoded defaults)
         self.dock_positions = {}
-        for i in range(5):
-            self.dock_positions[i] = {
-                'x': self.DOCK_FIRST_X + i * self.DOCK_OFFSET_X,
-                'y': self.DOCK_Y
-            }
+        self.dock_positions_calibrated = {}  # Track which docks were loaded from config
+        self._load_dock_positions()
+
+        # Dock calibration state
+        self.dock_cal_active = False
 
         # Register config callback for MCU setup
         self.mcu.register_config_callback(self._build_config)
@@ -2056,6 +2056,46 @@ class PuppyBootloader:
             pass
 
         return offsets
+
+    def _load_dock_positions(self):
+        """Load dock positions from printer.cfg [puppy_bootloader] section.
+
+        Positions are stored as:
+        dock_pos_t0 = 25.0000, 455.0000
+        dock_pos_t1 = 107.0000, 455.0000
+        etc.
+
+        Falls back to hardcoded defaults if not found in config.
+        Clamps dock_y to 460.0 max (wiggle overflow protection).
+        """
+        for tool in range(5):
+            default_x = self.DOCK_FIRST_X + tool * self.DOCK_OFFSET_X
+            default_y = self.DOCK_Y
+            key = f'dock_pos_t{tool}'
+            try:
+                value = self.config.get(key, None)
+                if value is not None:
+                    parts = [float(v.strip()) for v in value.split(',')]
+                    if len(parts) == 2:
+                        x, y = parts
+                        # Clamp Y to prevent wiggle overflow past Y_MAX (461)
+                        if y > 460.0:
+                            logging.warning(
+                                f"PuppyBootloader: T{tool} dock_y={y:.1f} "
+                                f"exceeds 460.0 - clamping")
+                            y = 460.0
+                        self.dock_positions[tool] = {'x': x, 'y': y}
+                        self.dock_positions_calibrated[tool] = True
+                        logging.info(
+                            f"PuppyBootloader: Loaded T{tool} dock: "
+                            f"X={x:.4f} Y={y:.4f} (calibrated)")
+                        continue
+            except Exception as e:
+                logging.warning(
+                    f"PuppyBootloader: Error loading T{tool} dock pos: {e}")
+            # Use hardcoded default
+            self.dock_positions[tool] = {'x': default_x, 'y': default_y}
+            self.dock_positions_calibrated[tool] = False
 
     def _save_tool_offsets(self):
         """Save tool offsets to printer.cfg via Klipper's SAVE_CONFIG mechanism.
@@ -5537,35 +5577,281 @@ class PuppyBootloader:
         """Show configured dock positions for all tools"""
         for i in range(5):
             pos = self.dock_positions[i]
+            cal = self.dock_positions_calibrated.get(i, False)
+            source = "calibrated" if cal else "default"
             self.gcode.respond_info(
-                f"T{i}: X={pos['x']:.1f} Y={pos['y']:.1f}")
+                f"T{i}: X={pos['x']:.4f} Y={pos['y']:.4f} ({source})")
         self.gcode.respond_info(
             f"Safe Y with tool: {self.SAFE_Y_WITH_TOOL}")
         self.gcode.respond_info(
             f"Safe Y without tool: {self.SAFE_Y_WITHOUT_TOOL}")
 
-    def cmd_DOCK_CALIBRATE(self, gcmd):
-        """Calibrate dock position - tool must be manually attached to carriage.
-        Usage: DOCK_CALIBRATE T=<tool> (then home X/Y to establish position)"""
-        tool = gcmd.get_int('T', 0)
-        dwarf = tool + 1
-        if dwarf not in self.booted_dwarfs:
-            raise gcmd.error(f"Tool {tool} (Dwarf {dwarf}) not available")
+    # ================================================================
+    # DOCK CALIBRATION - Interactive state machine
+    # ================================================================
+    # Uses Klipper's bed_screws.py pattern: temporary GCode command
+    # registration for user interaction (DOCK_CAL_CONTINUE/ABORT).
+    # Measures actual dock positions using MCU stepper position counting.
+    # ================================================================
 
-        # Check that tool is actually picked
-        state = self._get_dock_state(dwarf)
-        if not state:
-            raise gcmd.error("Failed to read dock state")
-        picked, parked = state
-        if not picked:
+    # Calibration constants
+    DOCK_CAL_UNLOCK_X = -9.9       # X unlock distance (Prusa X_UNLOCK_DISTANCE_MM)
+    DOCK_CAL_RETREAT_Y = 95.0      # Y retreat distance from dock to safe area
+    DOCK_INVALID_OFFSET = 6.0      # Max deviation from default (mm, Euclidean)
+    DOCK_CAL_VERIFY_CYCLES = 3     # Pick/park verification cycles
+
+    def cmd_DOCK_CALIBRATE(self, gcmd):
+        """Interactive dock position calibration.
+
+        Guides user through physical dock alignment, measures actual position
+        using MCU stepper counting, validates, and runs pick/park verification.
+
+        Usage: DOCK_CALIBRATE [DOCK=0]
+        Calibrates one dock at a time. Omit DOCK to calibrate all.
+        """
+        if self.dock_cal_active:
             raise gcmd.error(
-                f"T{tool} is not attached to carriage (is_picked=False). "
-                "Manually attach it first!")
+                "Dock calibration already in progress! "
+                "Use DOCK_CAL_ABORT to cancel.")
+
+        dock = gcmd.get_int('DOCK', -1)
+        if dock >= 0:
+            if dock > 4:
+                raise gcmd.error(f"Invalid dock {dock} (must be 0-4)")
+            dwarf = dock + 1
+            if dwarf not in self.booted_dwarfs:
+                raise gcmd.error(
+                    f"Dock {dock} (Dwarf {dwarf}) not available")
+            self._cal_dock_list = [dock]
+        else:
+            # All available docks
+            self._cal_dock_list = sorted(
+                [d - 1 for d in self.booted_dwarfs])
+
+        # Save original positions for rollback on abort
+        self._cal_saved_positions = {
+            t: dict(pos) for t, pos in self.dock_positions.items()}
+
+        # Initialize calibration state
+        self._cal_dock_idx = 0
+        self._cal_state = 'init'
+        self._cal_verify_count = 0
+
+        self.dock_cal_active = True
+        try:
+            self.gcode.register_command(
+                'DOCK_CAL_CONTINUE', self._cmd_dock_cal_continue,
+                desc="Continue dock calibration")
+            self.gcode.register_command(
+                'DOCK_CAL_ABORT', self._cmd_dock_cal_abort,
+                desc="Abort dock calibration")
+        except Exception:
+            self.dock_cal_active = False
+            raise gcmd.error(
+                "Failed to register calibration commands - "
+                "is another calibration running?")
+
+        self._dock_cal_begin()
+
+    def _dock_cal_cleanup(self):
+        """Unregister temp commands and reset calibration state."""
+        self.dock_cal_active = False
+        try:
+            self.gcode.register_command('DOCK_CAL_CONTINUE', None)
+        except Exception:
+            pass
+        try:
+            self.gcode.register_command('DOCK_CAL_ABORT', None)
+        except Exception:
+            pass
+
+    def _cmd_dock_cal_abort(self, gcmd):
+        """Abort dock calibration and revert positions."""
+        # Restore original dock positions
+        if hasattr(self, '_cal_saved_positions'):
+            self.dock_positions = self._cal_saved_positions
+        self._dock_cal_cleanup()
+        self.gcode.respond_info(
+            "Dock calibration ABORTED. Positions reverted.")
+
+    def _cmd_dock_cal_continue(self, gcmd):
+        """Process next step in dock calibration."""
+        try:
+            self._dock_cal_step()
+        except Exception as e:
+            self._dock_cal_cleanup()
+            raise gcmd.error(f"Dock calibration error: {e}")
+
+    def _dock_cal_begin(self):
+        """Start calibration for the current dock in the list."""
+        dock = self._cal_dock_list[self._cal_dock_idx]
+        dwarf = dock + 1
+        default_x = self.DOCK_FIRST_X + dock * self.DOCK_OFFSET_X
+        default_y = self.DOCK_Y
 
         self.gcode.respond_info(
-            f"T{tool} detected on carriage. Undocking and homing...")
+            f"\n=== DOCK CALIBRATION: DOCK {dock} (T{dock}) ===")
+        self.gcode.respond_info(
+            f"Default position: X={default_x:.1f} Y={default_y:.1f}")
 
-        # Enable TMC FIRST before setting tool_picked (safety fix)
+        # Illuminate target dock LED
+        self._write_register(
+            dwarf, self.LED_REG_CHEESE,
+            (255 << 8) | 255)  # Both selected and not_selected = always on
+
+        # Ensure Z is high enough for clearance
+        toolhead = self.printer.lookup_object('toolhead')
+        curtime = self.reactor.monotonic()
+        kin_status = toolhead.get_status(curtime)
+        homed = kin_status.get('homed_axes', '')
+
+        if 'z' in homed:
+            cur_pos = toolhead.get_position()
+            if cur_pos[2] < 100.0:
+                self.gcode.respond_info("Raising Z to 100mm for clearance...")
+                self.gcode.run_script_from_command("G1 Z100 F600")
+                self._wait_for_moves()
+
+        # Check if a tool is currently picked
+        if self.tool_picked and self.active_tool >= 0:
+            self._cal_state = 'park_tool'
+            self.gcode.respond_info(
+                f"\nT{self.active_tool} is currently picked.")
+            self.gcode.respond_info(
+                "XY steppers will be disabled. Manually park the tool,")
+            self.gcode.respond_info(
+                "then type DOCK_CAL_CONTINUE")
+            self.gcode.respond_info(
+                "(or DOCK_CAL_ABORT to cancel)")
+            # Disable XY steppers so user can move carriage
+            self.gcode.run_script_from_command("M84 X Y")
+        else:
+            self._cal_state = 'remove_pins'
+            self.gcode.respond_info(
+                f"\nSTEP 1: Remove the dock pins from Dock {dock}")
+            self.gcode.respond_info(
+                "Type DOCK_CAL_CONTINUE when done, "
+                "or DOCK_CAL_ABORT to cancel")
+
+    def _dock_cal_step(self):
+        """Advance the calibration state machine one step."""
+        dock = self._cal_dock_list[self._cal_dock_idx]
+        dwarf = dock + 1
+        state = self._cal_state
+
+        if state == 'park_tool':
+            # User manually parked the tool - clear state
+            self.tool_picked = False
+            self.active_tool = -1
+            # Deselect all dwarfs
+            for d in self.booted_dwarfs:
+                self._write_coil(d, 0x4001, False)
+            self._cal_state = 'remove_pins'
+            self.gcode.respond_info(
+                f"\nSTEP 1: Remove the dock pins from Dock {dock}")
+            self.gcode.respond_info(
+                "Type DOCK_CAL_CONTINUE when done")
+
+        elif state == 'remove_pins':
+            self._cal_state = 'loosen_screws'
+            self.gcode.respond_info(
+                f"\nSTEP 2: Loosen BOTH screws on the right side "
+                f"of Dock {dock}'s pillar")
+            self.gcode.respond_info(
+                "Type DOCK_CAL_CONTINUE when done")
+
+        elif state == 'loosen_screws':
+            # Disable XY steppers so user can move carriage by hand
+            self.gcode.run_script_from_command("M84 X Y")
+            self._cal_state = 'slide_carriage'
+            self.gcode.respond_info(
+                f"\nSTEP 3: Slide the carriage to align with T{dock} "
+                f"and lock it onto the tool in Dock {dock}")
+            self.gcode.respond_info(
+                "    XY steppers are disabled - move by hand")
+            self.gcode.respond_info(
+                "Type DOCK_CAL_CONTINUE when locked")
+
+        elif state == 'slide_carriage':
+            # Re-enable steppers to hold position
+            # M17 is a stub but we also need to re-mark axes
+            # Use SET_KINEMATIC_POSITION to re-enable moves
+            expected_x = self.DOCK_FIRST_X + dock * self.DOCK_OFFSET_X
+            expected_y = self.DOCK_Y
+            self.gcode.run_script_from_command(
+                f"SET_KINEMATIC_POSITION X={expected_x:.1f} "
+                f"Y={expected_y:.1f} Z=100")
+
+            # Verify dock sensors
+            state_check = self._get_dock_state(dwarf)
+            if state_check:
+                picked, parked = state_check
+                if not picked:
+                    self.gcode.respond_info(
+                        f"WARNING: T{dock} not detected as picked "
+                        f"(is_picked={picked}). Check alignment!")
+                self.gcode.respond_info(
+                    f"Dock sensors: picked={picked} parked={parked}")
+
+            self._cal_state = 'tighten_top'
+            self.gcode.respond_info(
+                "\nSTEP 4: DO NOT MOVE THE CARRIAGE")
+            self.gcode.respond_info(
+                "    Tighten the TOP dock screw ONLY")
+            self.gcode.respond_info(
+                "Type DOCK_CAL_CONTINUE when done")
+
+        elif state == 'tighten_top':
+            self._cal_state = 'measuring'
+            self.gcode.respond_info(
+                "\nSTEP 5: DO NOT TOUCH THE PRINTER - "
+                "measuring dock position...")
+            self._dock_cal_measure(dock)
+
+        elif state == 'tighten_bottom':
+            self._cal_state = 'install_pins'
+            self.gcode.respond_info(
+                f"\nSTEP 7: Install and tighten dock pins on Dock {dock}")
+            self.gcode.respond_info(
+                "Type DOCK_CAL_CONTINUE when done")
+
+        elif state == 'install_pins':
+            self._cal_state = 'park_verify'
+            self.gcode.respond_info(
+                "\nSTEP 8: DO NOT TOUCH - running park verification...")
+            self._dock_cal_park_verify(dock)
+
+        elif state == 'pick_park_verify':
+            # This state is entered after park_verify succeeds
+            self._cal_state = 'verifying'
+            self.gcode.respond_info(
+                "\nSTEP 9: DO NOT TOUCH - running "
+                f"{self.DOCK_CAL_VERIFY_CYCLES}x pick/park verification...")
+            self._cal_verify_count = 0
+            self._dock_cal_pick_park_verify(dock)
+
+        elif state == 'dock_complete':
+            self._dock_cal_next_dock()
+
+        else:
+            self.gcode.respond_info(
+                f"Unknown calibration state: {state}")
+            self._dock_cal_cleanup()
+
+    def _dock_cal_measure(self, dock):
+        """Measure actual dock position using MCU stepper counting.
+
+        Sequence:
+        1. Record MCU step positions at dock
+        2. Enable TMC, set tool state
+        3. Undock (X unlock + Y retreat)
+        4. Home XY (establishes true absolute position)
+        5. Compute dock position from step deltas + home position
+        """
+        dwarf = dock + 1
+        toolhead = self.printer.lookup_object('toolhead')
+
+        # Enable TMC before setting tool_picked (critical ordering)
         tmc_enabled = False
         for attempt in range(3):
             if self._write_coil(dwarf, 0x4000, True):
@@ -5574,44 +5860,366 @@ class PuppyBootloader:
                 break
             self.reactor.pause(self.reactor.monotonic() + 0.1)
         if not tmc_enabled:
-            raise gcmd.error(f"Failed to enable TMC on T{tool} - cannot proceed")
+            self._dock_cal_cleanup()
+            self.gcode.respond_info(
+                f"FAILED: Could not enable TMC on T{dock}")
+            return
 
-        # Set is_selected so Dwarf knows it's active
+        # Set is_selected and tool state
         self._write_coil(dwarf, 0x4001, True)
-        self.active_tool = tool
+        self.active_tool = dock
         self.tool_picked = True
 
-        # Move Y forward to safe position (undock from dock)
-        self._move_xy(y=self.SAFE_Y_WITH_TOOL, speed=self.SLOW_SPEED)
+        # Record MCU step positions at dock (before any movement)
+        toolhead.wait_moves()
+        kin = toolhead.get_kinematics()
+        steppers = kin.get_steppers()
+        # CoreXY: rails[0] = A motor (stepper_x), rails[1] = B motor (stepper_y)
+        stepper_a = None
+        stepper_b = None
+        for s in steppers:
+            name = s.get_name()
+            if name == 'stepper_x':
+                stepper_a = s
+            elif name == 'stepper_y':
+                stepper_b = s
+        if stepper_a is None or stepper_b is None:
+            self._dock_cal_cleanup()
+            self.gcode.respond_info(
+                "FAILED: Could not find stepper_x/stepper_y")
+            return
+
+        pre_a = stepper_a.get_mcu_position()
+        pre_b = stepper_b.get_mcu_position()
+        step_dist_a = stepper_a.get_step_dist()
+        step_dist_b = stepper_b.get_step_dist()
+
+        logging.info(
+            f"PuppyBootloader: Dock cal T{dock} pre-dock MCU steps: "
+            f"A={pre_a} B={pre_b} step_dist={step_dist_a:.6f}")
+
+        # Set approximate position for valid moves
+        expected_x = self.DOCK_FIRST_X + dock * self.DOCK_OFFSET_X
+        expected_y = self.DOCK_Y
+        self.gcode.run_script_from_command(
+            f"SET_KINEMATIC_POSITION X={expected_x:.1f} "
+            f"Y={expected_y:.1f} Z=100")
+
+        # Unlock move: X displacement to release from dock
+        self.gcode.run_script_from_command("G91")
+        self.gcode.run_script_from_command(
+            f"G1 X{self.DOCK_CAL_UNLOCK_X:.1f} F{30 * 60}")
         self._wait_for_moves()
 
-        # Verify we're no longer parked
-        state = self._get_dock_state(dwarf)
-        if state:
-            picked, parked = state
-            if parked:
-                raise gcmd.error("Tool still reports parked after undock move!")
-            self.gcode.respond_info(
-                f"Undocked: picked={picked} parked={parked}")
+        # Retreat Y toward front
+        self.gcode.run_script_from_command(
+            f"G1 Y-{self.DOCK_CAL_RETREAT_Y:.1f} F{30 * 60}")
+        self._wait_for_moves()
+        self.gcode.run_script_from_command("G90")
 
-        # Home X and Y
+        # Verify undocked
+        self.reactor.pause(self.reactor.monotonic() + 0.3)
+        dock_state = self._get_dock_state(dwarf)
+        if dock_state:
+            picked, parked = dock_state
+            if parked:
+                self.gcode.respond_info(
+                    "WARNING: Still reporting parked after undock!")
+            self.gcode.respond_info(
+                f"After undock: picked={picked} parked={parked}")
+
+        # Home XY to establish true absolute position
         self.gcode.respond_info("Homing X and Y...")
         self.gcode.run_script_from_command("G28 X Y")
         self._wait_for_moves()
 
-        # Now we know absolute position. The dock is at:
-        # X = current position (we moved straight Y, so X didn't change)
-        # Y = DOCK_Y (455mm from home)
-        # But since we moved Y to SAFE_Y_WITH_TOOL, the dock Y is behind us
-        # The dock X is wherever the tool was when attached
-        # For stock Prusa XL, use the default positions
-        dock_x = self._get_dock_x(tool)
-        dock_y = self._get_dock_y(tool)
+        # Record post-home MCU step positions
+        toolhead.wait_moves()
+        post_a = stepper_a.get_mcu_position()
+        post_b = stepper_b.get_mcu_position()
+        home_pos = toolhead.get_position()
+
+        logging.info(
+            f"PuppyBootloader: Dock cal T{dock} post-home MCU steps: "
+            f"A={post_a} B={post_b} home_pos=({home_pos[0]:.3f}, "
+            f"{home_pos[1]:.3f})")
+
+        # Compute dock position from step deltas
+        # CoreXY: A = X+Y, B = X-Y
+        # delta = displacement from dock to home (in joint mm)
+        delta_a_mm = (pre_a - post_a) * step_dist_a
+        delta_b_mm = (pre_b - post_b) * step_dist_b
+        # Convert joint space to cartesian
+        delta_x = (delta_a_mm + delta_b_mm) / 2.0
+        delta_y = (delta_a_mm - delta_b_mm) / 2.0
+        # Dock position = home position + displacement from home to dock
+        measured_x = home_pos[0] + delta_x
+        measured_y = home_pos[1] + delta_y
+
+        logging.info(
+            f"PuppyBootloader: Dock cal T{dock} measured: "
+            f"X={measured_x:.4f} Y={measured_y:.4f} "
+            f"(delta_a={delta_a_mm:.3f} delta_b={delta_b_mm:.3f} "
+            f"delta_x={delta_x:.3f} delta_y={delta_y:.3f})")
+
+        # Validate against expected position
+        offset = math.sqrt(
+            (measured_x - expected_x) ** 2 +
+            (measured_y - expected_y) ** 2)
+
+        if offset > self.DOCK_INVALID_OFFSET:
+            self.gcode.respond_info(
+                f"FAILED: Dock {dock} measured X={measured_x:.4f} "
+                f"Y={measured_y:.4f}")
+            self.gcode.respond_info(
+                f"Offset {offset:.2f}mm exceeds maximum "
+                f"{self.DOCK_INVALID_OFFSET:.1f}mm from default "
+                f"(X={expected_x:.1f} Y={expected_y:.1f})")
+            self.gcode.respond_info(
+                "Check dock alignment and try again.")
+            self._dock_cal_cleanup()
+            return
+
+        # Clamp Y for wiggle overflow protection
+        if measured_y > 460.0:
+            logging.warning(
+                f"PuppyBootloader: Dock cal T{dock} measured_y="
+                f"{measured_y:.4f} clamped to 460.0")
+            measured_y = 460.0
+
         self.gcode.respond_info(
-            f"T{tool} dock position: X={dock_x:.1f} Y={dock_y:.1f}")
+            f"Dock {dock} measured: X={measured_x:.4f} "
+            f"Y={measured_y:.4f} (offset: {offset:.2f}mm from "
+            f"default - OK)")
+
+        # Store measured position
+        self.dock_positions[dock] = {
+            'x': measured_x, 'y': measured_y}
+        self.dock_positions_calibrated[dock] = True
+
+        # Stage for SAVE_CONFIG
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(
+            'puppy_bootloader', f'dock_pos_t{dock}',
+            f'{measured_x:.4f}, {measured_y:.4f}')
+
+        self._cal_state = 'tighten_bottom'
         self.gcode.respond_info(
-            "Using default Prusa XL dock positions. "
-            "Tool is now active on carriage.")
+            f"\nSTEP 6: Tighten the BOTTOM dock screw on Dock {dock}")
+        self.gcode.respond_info(
+            "Type DOCK_CAL_CONTINUE when done")
+
+    def _dock_cal_park_verify(self, dock):
+        """Slow park verification using measured position."""
+        dwarf = dock + 1
+        dock_x = self.dock_positions[dock]['x']
+        dock_y = self.dock_positions[dock]['y']
+
+        # Make sure tool is active (should be from measurement step)
+        if not self.tool_picked or self.active_tool != dock:
+            # Re-establish tool state
+            self._write_coil(dwarf, 0x4000, True)
+            self.tmc_enabled[dwarf] = True
+            self._write_coil(dwarf, 0x4001, True)
+            self.active_tool = dock
+            self.tool_picked = True
+
+        # Move to approach position
+        self._move_xy(x=dock_x + self.PARK_X_OFFSET_1,
+                      y=self.SAFE_Y_WITH_TOOL,
+                      speed=self.TRAVEL_SPEED)
+        self._wait_for_moves()
+
+        # Move to dock Y
+        self._move_xy(y=dock_y, speed=self.TRAVEL_SPEED)
+        self._wait_for_moves()
+
+        # Unlock with parking current
+        self.gcode.run_script_from_command(
+            f"SET_TMC_CURRENT STEPPER=stepper_x CURRENT="
+            f"{self.PARKING_CURRENT / 1000:.3f}")
+        self.gcode.run_script_from_command(
+            f"SET_TMC_CURRENT STEPPER=stepper_y CURRENT="
+            f"{self.PARKING_CURRENT / 1000:.3f}")
+
+        self._move_xy(x=dock_x + self.PARK_X_OFFSET_2,
+                      speed=self.SLOW_SPEED)
+        self._wait_for_moves()
+        self._move_xy(x=dock_x + self.PARK_X_OFFSET_3,
+                      speed=self.SLOW_SPEED)
+        self._wait_for_moves()
+
+        # Restore current
+        self.gcode.run_script_from_command(
+            f"SET_TMC_CURRENT STEPPER=stepper_x CURRENT="
+            f"{self.NORMAL_CURRENT / 1000:.3f}")
+        self.gcode.run_script_from_command(
+            f"SET_TMC_CURRENT STEPPER=stepper_y CURRENT="
+            f"{self.NORMAL_CURRENT / 1000:.3f}")
+
+        # Insert into dock
+        self._move_xy(x=dock_x, y=dock_y, speed=self.SLOW_SPEED)
+        self._wait_for_moves()
+
+        # Verify parked
+        self.reactor.pause(self.reactor.monotonic() + 0.3)
+        state = self._get_dock_state(dwarf)
+        parked = False
+        if state:
+            picked, parked = state
+        if not parked:
+            self.gcode.respond_info(
+                f"FAILED: T{dock} not detected as parked!")
+            self.gcode.respond_info(
+                "Check dock alignment and try again.")
+            self._dock_cal_cleanup()
+            return
+
+        # Retract from dock
+        self._move_xy(y=self.SAFE_Y_WITHOUT_TOOL,
+                      speed=self.TRAVEL_SPEED)
+        self._wait_for_moves()
+
+        # Verify not picked
+        self.reactor.pause(self.reactor.monotonic() + 0.3)
+        state = self._get_dock_state(dwarf)
+        if state:
+            picked, parked = state
+            if picked:
+                self.gcode.respond_info(
+                    f"WARNING: T{dock} still reports picked after retract!")
+
+        # Clear tool state since we just parked
+        self._write_coil(dwarf, 0x4001, False)  # Deselect
+        self.tool_picked = False
+        self.active_tool = -1
+
+        self.gcode.respond_info(
+            f"Park test: parked={parked} - OK")
+
+        self._cal_state = 'pick_park_verify'
+        self.gcode.respond_info(
+            "\nPark verification passed!")
+        self.gcode.respond_info(
+            "Type DOCK_CAL_CONTINUE to run "
+            f"{self.DOCK_CAL_VERIFY_CYCLES}x pick/park verification")
+
+    def _dock_cal_pick_park_verify(self, dock):
+        """Run pick/park verification cycles using TOOL_PICK/TOOL_PARK."""
+        dwarf = dock + 1
+
+        # Temporarily allow TOOL_PICK/TOOL_PARK during verification
+        self.dock_cal_active = False
+        try:
+            for cycle in range(self._cal_verify_count,
+                               self.DOCK_CAL_VERIFY_CYCLES):
+                self._cal_verify_count = cycle + 1
+
+                # Pick
+                self.gcode.respond_info(
+                    f"Pick/Park cycle {cycle + 1}/"
+                    f"{self.DOCK_CAL_VERIFY_CYCLES}...")
+                try:
+                    self.gcode.run_script_from_command(
+                        f"TOOL_PICK T={dock}")
+                    self._wait_for_moves()
+                except Exception as e:
+                    self.gcode.respond_info(
+                        f"FAILED: Pick failed on cycle {cycle + 1}: {e}")
+                    self.dock_positions = self._cal_saved_positions
+                    self.dock_positions_calibrated[dock] = False
+                    self._dock_cal_cleanup()
+                    return
+
+                # Verify picked
+                state = self._get_dock_state(dwarf)
+                if not state or not state[0]:
+                    self.gcode.respond_info(
+                        f"FAILED: T{dock} not picked on cycle "
+                        f"{cycle + 1}")
+                    self.dock_positions = self._cal_saved_positions
+                    self.dock_positions_calibrated[dock] = False
+                    self._dock_cal_cleanup()
+                    return
+
+                # Park
+                try:
+                    self.gcode.run_script_from_command("TOOL_PARK")
+                    self._wait_for_moves()
+                except Exception as e:
+                    self.gcode.respond_info(
+                        f"FAILED: Park failed on cycle {cycle + 1}: "
+                        f"{e}")
+                    self.dock_positions = self._cal_saved_positions
+                    self.dock_positions_calibrated[dock] = False
+                    self._dock_cal_cleanup()
+                    return
+
+                # Verify parked
+                state = self._get_dock_state(dwarf)
+                if not state or not state[1]:
+                    self.gcode.respond_info(
+                        f"FAILED: T{dock} not parked on cycle "
+                        f"{cycle + 1}")
+                    self.dock_positions = self._cal_saved_positions
+                    self.dock_positions_calibrated[dock] = False
+                    self._dock_cal_cleanup()
+                    return
+
+                self.gcode.respond_info(
+                    f"Pick/Park cycle {cycle + 1}/"
+                    f"{self.DOCK_CAL_VERIFY_CYCLES}: OK")
+        finally:
+            # Re-enable the guard (cleanup will clear it if we're done)
+            self.dock_cal_active = True
+
+        self.gcode.respond_info(
+            f"\nDock {dock} calibration COMPLETE!")
+
+        # Restore cheese LED to normal (selected=on, not_selected=off)
+        self._configure_cheese_led(dwarf)
+
+        self._cal_state = 'dock_complete'
+        self._dock_cal_next_dock()
+
+    def _dock_cal_next_dock(self):
+        """Move to next dock or finish calibration."""
+        self._cal_dock_idx += 1
+        if self._cal_dock_idx < len(self._cal_dock_list):
+            dock = self._cal_dock_list[self._cal_dock_idx]
+            self._cal_state = 'remove_pins'
+            self._cal_verify_count = 0
+            # Start next dock
+            dwarf = dock + 1
+            default_x = self.DOCK_FIRST_X + dock * self.DOCK_OFFSET_X
+            default_y = self.DOCK_Y
+            self.gcode.respond_info(
+                f"\n=== DOCK CALIBRATION: DOCK {dock} (T{dock}) ===")
+            self.gcode.respond_info(
+                f"Default position: X={default_x:.1f} Y={default_y:.1f}")
+            # Illuminate target dock
+            self._write_register(
+                dwarf, self.LED_REG_CHEESE, (255 << 8) | 255)
+            self.gcode.respond_info(
+                f"\nSTEP 1: Remove the dock pins from Dock {dock}")
+            self.gcode.respond_info(
+                "Type DOCK_CAL_CONTINUE when done, "
+                "or DOCK_CAL_ABORT to cancel")
+        else:
+            # All docks done
+            self._dock_cal_cleanup()
+            self.gcode.respond_info(
+                "\n=== ALL DOCK CALIBRATION COMPLETE ===")
+            self.gcode.respond_info(
+                "Calibrated positions:")
+            for dock in self._cal_dock_list:
+                pos = self.dock_positions[dock]
+                self.gcode.respond_info(
+                    f"  T{dock}: X={pos['x']:.4f} Y={pos['y']:.4f}")
+            self.gcode.respond_info(
+                "\nRun SAVE_CONFIG to persist to printer.cfg")
+            # Restore all cheese LEDs to normal
+            self._update_all_leds()
 
 
     def cmd_SET_TOOL_STATE(self, gcmd):
@@ -6027,6 +6635,10 @@ class PuppyBootloader:
     def cmd_TOOL_PICK(self, gcmd):
         """Pick up a tool from its dock.
         Usage: TOOL_PICK T=<tool>"""
+        if self.dock_cal_active:
+            raise gcmd.error(
+                "Dock calibration in progress! Complete or abort "
+                "calibration before changing tools.")
         tool = gcmd.get_int('T', 0)
         dwarf = tool + 1
         if dwarf not in self.booted_dwarfs:
@@ -6405,6 +7017,10 @@ class PuppyBootloader:
     def cmd_TOOL_PARK(self, gcmd):
         """Park the current tool back in its dock.
         Usage: TOOL_PARK"""
+        if self.dock_cal_active:
+            raise gcmd.error(
+                "Dock calibration in progress! Complete or abort "
+                "calibration before changing tools.")
         if not self.tool_picked or self.active_tool < 0:
             raise gcmd.error("No tool is currently picked!")
 
