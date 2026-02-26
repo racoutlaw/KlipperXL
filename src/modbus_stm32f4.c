@@ -36,6 +36,7 @@
 // Forward declarations
 void USART3_IRQHandler(void);
 static void puppy_boot_sequence(void);
+void watchdog_reset(void);
 
 /****************************************************************
  * Configuration
@@ -108,7 +109,7 @@ static void puppy_boot_sequence(void);
 #define MODBUS_ERR_CRC         2
 #define MODBUS_ERR_EXCEPTION   3
 #define MODBUS_ERR_FRAME       4
-#define MODBUS_ERR_BUSY        5
+#define MODBUS_ERR_BUSY        0xFE  // Disambiguate from bootloader status=5
 
 /****************************************************************
  * Global State
@@ -516,9 +517,16 @@ void USART3_IRQHandler(void)
         rs485_rx_enable();
         // Small delay for transceiver to settle
         for (volatile int i = 0; i < 100; i++) {}
-        // Clear any pending RX data/flags from TX echo
+        // Drain all echo bytes (DR + shift register).
+        // Must use 3-stage pattern: drain DR, clear ORE, drain again.
+        // Single SR+DR read leaves last echo byte in DR (see
+        // serial_bridge_write lines 2220-2228 for the working template).
+        while (MODBUS_USART->SR & USART_SR_RXNE)
+            (void)MODBUS_USART->DR;
         (void)MODBUS_USART->SR;
         (void)MODBUS_USART->DR;
+        while (MODBUS_USART->SR & USART_SR_RXNE)
+            (void)MODBUS_USART->DR;
         // Now ready to receive - polling will handle RX (no RXNEIE)
         modbus.state = 2;  // Receiving
         modbus.rx_pos = 0;
@@ -534,10 +542,11 @@ void USART3_IRQHandler(void)
  ****************************************************************/
 
 static int
-send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_len, uint16_t max_resp, uint32_t timeout_ms)
+send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_len, uint16_t max_resp, uint32_t timeout_ms, uint8_t bootloader_resp)
 {
+    watchdog_reset();  // Keep watchdog alive for long bootloader ops (400ms)
     if (!modbus.initialized)
-        return MODBUS_ERR_BUSY;
+        modbus_uart_init();
     if (modbus.state != 0)
         return MODBUS_ERR_BUSY;
     if (len > MODBUS_TX_BUF_SIZE)
@@ -548,13 +557,13 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
         // busy wait
     }
 
-    // Flush any stale UART data before transmitting
-    while (MODBUS_USART->SR & USART_SR_RXNE) {
+    // Flush any stale UART data before transmitting (3-stage drain)
+    while (MODBUS_USART->SR & USART_SR_RXNE)
         (void)MODBUS_USART->DR;
-    }
-    // Clear any error flags
     (void)MODBUS_USART->SR;
     (void)MODBUS_USART->DR;
+    while (MODBUS_USART->SR & USART_SR_RXNE)
+        (void)MODBUS_USART->DR;
 
     // Copy data to TX buffer
     memcpy(modbus.tx_buf, data, len);
@@ -563,6 +572,14 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
     modbus.rx_pos = 0;
     modbus.state = 1;  // Transmitting
     modbus.error = MODBUS_OK;
+
+    // Disable USB IRQ for entire TX+RX cycle to prevent byte overrun.
+    // USB ISR (priority 1) preempts USART3 polling, causing ORE at
+    // 230400 baud on single-byte STM32F4 USART.  Previously disabled
+    // only after state==2 (RX), but that left a race window between
+    // TC ISR setting state=2 and the polling loop's next iteration.
+    NVIC_DisableIRQ(OTG_FS_IRQn);
+    int usb_irq_disabled = 1;
 
     // Start transmission
     irq_disable();
@@ -576,10 +593,14 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
 
     // Wait for response using pure polling (no RX interrupts)
     uint32_t timeout = timer_read_time() + timer_from_us(timeout_ms * 1000);
-    // First byte must arrive within timeout, otherwise no response
-    uint32_t first_byte_timeout = timer_read_time() + timer_from_us(MODBUS_FIRST_BYTE_US);
+    // First byte must arrive within timeout, otherwise no response.
+    // Bootloader ops get the full timeout — page erase on STM32G070
+    // can take 5-10ms+ on top of TX time, easily exceeding 100ms.
+    uint32_t first_byte_timeout = timer_read_time() + timer_from_us(
+        bootloader_resp ? timeout_ms * 1000 : MODBUS_FIRST_BYTE_US);
 
     while (modbus.state != 0) {
+
         // Overall timeout
         if (timer_is_before(timeout, timer_read_time())) {
             irq_disable();  // Prevent race with ISR
@@ -608,6 +629,8 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
             } else if (resp_len) {
                 *resp_len = 0;
             }
+            if (usb_irq_disabled)
+                NVIC_EnableIRQ(OTG_FS_IRQn);
             return MODBUS_ERR_TIMEOUT;
         }
 
@@ -628,6 +651,8 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
                 irq_enable();
 
                 if (resp_len) *resp_len = 0;
+                if (usb_irq_disabled)
+                    NVIC_EnableIRQ(OTG_FS_IRQn);
                 return MODBUS_ERR_TIMEOUT;
             }
         }
@@ -660,6 +685,11 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
         // Bootloader resp:  [addr][status][len][data...][crc16]
         if (modbus.state == 2 && modbus.rx_pos >= 3) {
             uint16_t expected_len = 0;
+            if (bootloader_resp) {
+                // Bootloader response: [addr][status][len][data...][crc16]
+                uint8_t payload_len = modbus.rx_buf[2];
+                expected_len = 3 + payload_len + 2;
+            } else {
             uint8_t func_code = modbus.rx_buf[1];
             if (func_code & 0x80) {
                 // MODBUS exception response - always 5 bytes
@@ -682,6 +712,7 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
                 uint8_t payload_len = modbus.rx_buf[2];
                 expected_len = 3 + payload_len + 2;
             }
+            } // end else (MODBUS parsing)
             if (expected_len > 0) {
                 if (expected_len > MODBUS_RX_BUF_SIZE) expected_len = MODBUS_RX_BUF_SIZE;
                 if (modbus.rx_pos >= expected_len) {
@@ -699,6 +730,10 @@ send_frame_wait(uint8_t *data, uint16_t len, uint8_t *response, uint16_t *resp_l
             }
         }
     }
+
+    // Re-enable USB IRQ after RX polling complete
+    if (usb_irq_disabled)
+        NVIC_EnableIRQ(OTG_FS_IRQn);
 
     // Validate CRC on received frame
     if (modbus.rx_pos >= 5) {
@@ -775,7 +810,7 @@ bootloader_command(uint8_t addr, uint8_t cmd, uint8_t *data, uint8_t data_len,
     uint8_t response[64];
     uint16_t response_len = 0;
     
-    int ret = send_frame_wait(frame, frame_len, response, &response_len, sizeof(response), BOOTLOADER_TIMEOUT_MS);
+    int ret = send_frame_wait(frame, frame_len, response, &response_len, sizeof(response), BOOTLOADER_TIMEOUT_MS, 1);
     
     if (ret != MODBUS_OK) {
         return ret;
@@ -837,7 +872,7 @@ bootloader_assign_address(uint8_t current_addr, uint8_t new_addr)
     
     uint8_t response[8];
     uint16_t response_len = 0;
-    send_frame_wait(frame, frame_len, response, &response_len, sizeof(response), 10);  // Short timeout, no reply expected
+    send_frame_wait(frame, frame_len, response, &response_len, sizeof(response), 10, 0);  // Short timeout, no reply expected
 }
 
 // Start application on puppy - PROPER IMPLEMENTATION
@@ -881,7 +916,7 @@ bootloader_compute_fingerprint(uint8_t addr, uint32_t salt)
     
     uint8_t response[8];
     uint16_t response_len = 0;
-    return send_frame_wait(frame, frame_len, response, &response_len, sizeof(response), BOOTLOADER_TIMEOUT_MS);
+    return send_frame_wait(frame, frame_len, response, &response_len, sizeof(response), BOOTLOADER_TIMEOUT_MS, 1);
 }
 
 // Get computed fingerprint from puppy
@@ -952,7 +987,7 @@ puppy_boot_sequence(void)
 
     // Step 3: For each Dwarf, assign address, verify fingerprint, start app
     for (uint8_t dwarf = 1; dwarf <= NUM_DWARFS; dwarf++) {
-        uint8_t assigned_addr = BOOTLOADER_ADDR_FIRST + (dwarf - 1);  // 0x0A, 0x0B, ...
+        uint8_t assigned_addr = BOOTLOADER_ADDR_FIRST + dwarf;  // 0x0B, 0x0C, ...
 
         // 3a: Assign address - all Dwarfs at 0x00 will accept this
         bootloader_assign_address(BOOTLOADER_ADDR_DEFAULT, assigned_addr);
@@ -1233,7 +1268,7 @@ void command_modbus_send_raw(uint32_t *args)
     uint8_t response[128];
     uint16_t resp_len = 0;
 
-    int ret = send_frame_wait(data, data_len, response, &resp_len, sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS);
+    int ret = send_frame_wait(data, data_len, response, &resp_len, sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS, 0);
 
     // Cap response to fit within MESSAGE_MAX (64 bytes)
     uint16_t send_len = resp_len;
@@ -1241,6 +1276,25 @@ void command_modbus_send_raw(uint32_t *args)
     sendf("modbus_raw_response status=%c data=%*s", ret, send_len, response);
 }
 DECL_COMMAND(command_modbus_send_raw, "modbus_send_raw data=%*s");
+
+// Send raw RS485 frame with bootloader-aware response parsing.
+// Identical to modbus_send_raw but uses bootloader response format
+// [addr][status][len][data...][crc16] instead of MODBUS function codes.
+void command_modbus_send_raw_boot(uint32_t *args)
+{
+    uint8_t data_len = args[0];
+    uint8_t *data = command_decode_ptr(args[1]);
+
+    uint8_t response[128];
+    uint16_t resp_len = 0;
+
+    int ret = send_frame_wait(data, data_len, response, &resp_len, sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS, 1);
+
+    uint16_t send_len = resp_len;
+    if (send_len > 50) send_len = 50;
+    sendf("modbus_raw_boot_response status=%c data=%*s", ret, send_len, response);
+}
+DECL_COMMAND(command_modbus_send_raw_boot, "modbus_send_raw_boot data=%*s");
 
 // Read loadcell via FIFO - parses on MCU, returns compact result
 void command_modbus_read_loadcell(uint32_t *args)
@@ -1260,7 +1314,7 @@ void command_modbus_read_loadcell(uint32_t *args)
     uint8_t response[128];
     uint16_t resp_len = 0;
 
-    int ret = send_frame_wait(frame, 6, response, &resp_len, sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS);
+    int ret = send_frame_wait(frame, 6, response, &resp_len, sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS, 0);
 
     if (ret != MODBUS_OK || resp_len < 8) {
         // No valid response - return error with raw length for debug
@@ -1350,6 +1404,76 @@ void command_puppy_boot(uint32_t *args)
 }
 DECL_COMMAND(command_puppy_boot, "puppy_boot");
 
+// Boot a single Dwarf by number (1-5).
+// Resets target, assigns address, sends START_APPLICATION.
+// Dwarf 1 = 0x0B, Dwarf 2 = 0x0C, etc. (0x0A is modular bed)
+void command_dwarf_boot_single(uint32_t *args)
+{
+    uint8_t dwarf_num = args[0];
+    if (dwarf_num < 1 || dwarf_num > NUM_DWARFS) {
+        sendf("dwarf_boot_single_response status=%c addr=%c", 0xFF, 0);
+        return;
+    }
+
+    if (!modbus.initialized)
+        modbus_uart_init();
+
+    // Seed PRNG if not already seeded
+    simple_rand_state ^= timer_read_time();
+
+    uint8_t addr = BOOTLOADER_ADDR_FIRST + dwarf_num;  // 0x0B for Dwarf 1
+
+    // 1. Reset this Dwarf into bootloader
+    pca9557_set_output(dwarf_reset_bit(dwarf_num));
+    delay_ms(10);
+    pca9557_set_output(0x00);
+    delay_ms(200);  // Bootloader needs time to init USART after reset
+
+    // 2. Assign address (bootloader starts at 0x00)
+    bootloader_assign_address(BOOTLOADER_ADDR_DEFAULT, addr);
+    delay_ms(100);
+
+    // 3. Discover — verify Dwarf is responding at assigned address
+    int found = bootloader_discover(addr);
+    if (!found) {
+        sendf("dwarf_boot_single_response status=%c addr=%c", 0x01, addr);
+        return;
+    }
+
+    // 4. Compute fingerprint with random salt
+    uint32_t salt = simple_rand();
+    int ret = bootloader_compute_fingerprint(addr, salt);
+    if (ret != MODBUS_OK && ret != MODBUS_ERR_TIMEOUT) {
+        sendf("dwarf_boot_single_response status=%c addr=%c", 0x02, addr);
+        return;
+    }
+
+    // 5. Wait for SHA256 computation, poll GET_FINGERPRINT
+    delay_ms(1000);  // SHA256 takes 330-600ms on STM32G070
+    uint8_t fingerprint[32];
+    int fp_ok = 0;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        ret = bootloader_get_fingerprint(addr, fingerprint, 0, 32);
+        if (ret == 0) {
+            fp_ok = 1;
+            break;
+        }
+        delay_ms(100);
+    }
+
+    if (!fp_ok) {
+        sendf("dwarf_boot_single_response status=%c addr=%c", 0x03, addr);
+        return;
+    }
+
+    // 6. Start application with matching salt + fingerprint
+    ret = bootloader_start_app(addr, salt, fingerprint);
+
+    sendf("dwarf_boot_single_response status=%c addr=%c",
+          (ret == MODBUS_OK) ? 0x00 : 0x04, addr);
+}
+DECL_COMMAND(command_dwarf_boot_single, "dwarf_boot_single dwarf=%c");
+
 /****************************************************************
  * Task - Check for response timeout
  ****************************************************************/
@@ -1425,7 +1549,7 @@ static int loadcell_poll_fifo(void)
     uint16_t resp_len = 0;
 
     int ret = send_frame_wait(frame, 6, response, &resp_len,
-                              sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS);
+                              sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS, 0);
 
     if (ret != MODBUS_OK || resp_len < 8) {
         loadcell_probe.poll_errors++;
@@ -1683,7 +1807,7 @@ void command_loadcell_tare(uint32_t *args)
         uint16_t resp_len = 0;
 
         int ret = send_frame_wait(frame, 6, response, &resp_len,
-                                  sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS);
+                                  sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS, 0);
 
         if (ret != MODBUS_OK || resp_len < 8)
             continue;
@@ -1814,7 +1938,7 @@ static int filament_read_sensor(uint16_t *adc_out)
     uint16_t resp_len = 0;
 
     int ret = send_frame_wait(frame, 8, response, &resp_len,
-                              sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS);
+                              sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS, 0);
 
     if (ret != MODBUS_OK || resp_len < 7) {
         filament_endstop.poll_errors++;
@@ -1921,3 +2045,545 @@ void filament_sensor_task(void)
     }
 }
 DECL_TASK(filament_sensor_task);
+
+/****************************************************************
+ * Serial Bridge - Relay Klipper serial frames to/from Dwarf MCUs
+ *
+ * Supports up to 5 Dwarfs sharing the RS485 bus via multiprocessor
+ * addressing.  Each bridge_write sends an address byte (0x80|dwarf)
+ * before the Klipper frame data.  The addressed Dwarf processes
+ * the frame; others stay muted via USART idle line detection.
+ *
+ * Blocking design: each command blocks for the full TX→RX cycle
+ * (~2-7ms). watchdog_reset() is called before the RX poll.
+ *
+ * Wire protocol: [1ms idle gap] [0x80|dwarf] [klipper_frame_bytes]
+ * Address bytes 0x81-0x85 can never collide with Klipper message
+ * length bytes (always < 0x80 / CONFIG_MESSAGE_MAX = 64).
+ ****************************************************************/
+
+#define MAX_BRIDGE_DWARFS 5
+
+static struct {
+    uint8_t rx_buf[192];        // RS485 RX buffer for this Dwarf
+    uint8_t rx_pos;            // Current RX position
+    uint8_t rx_sent;           // Bytes already sent to host
+    uint8_t tx_buf[72];         // Accumulated TX data from bridge_append
+    uint8_t tx_pos;             // Current TX accumulation position
+} serial_bridge[MAX_BRIDGE_DWARFS];
+
+// Accumulate data for a subsequent serial_bridge_write.
+// Used when a Klipper frame exceeds bridge_write's payload limit
+// (~56 bytes due to MESSAGE_MAX=64).  The accumulated data is
+// prepended to the next bridge_write's payload before RS485 TX.
+void command_serial_bridge_append(uint32_t *args)
+{
+    uint8_t dwarf = args[0];
+    uint8_t data_len = args[1];
+    uint8_t *data = command_decode_ptr(args[2]);
+
+    if (dwarf < 1 || dwarf > MAX_BRIDGE_DWARFS)
+        return;
+    uint8_t idx = dwarf - 1;
+
+    uint8_t avail = sizeof(serial_bridge[idx].tx_buf)
+                  - serial_bridge[idx].tx_pos;
+    if (data_len > avail) data_len = avail;
+    memcpy(serial_bridge[idx].tx_buf + serial_bridge[idx].tx_pos,
+           data, data_len);
+    serial_bridge[idx].tx_pos += data_len;
+}
+DECL_COMMAND(command_serial_bridge_append,
+             "serial_bridge_append dwarf=%c data=%*s");
+
+// Send raw bytes on RS485 to a specific Dwarf and capture response.
+// dwarf param (1-5) selects target; address byte 0x80|dwarf is sent
+// on RS485 before the data payload.
+// Blocks for the full TX→RX cycle. watchdog_reset() prevents timeout.
+void command_serial_bridge_write(uint32_t *args)
+{
+    watchdog_reset();  // Survive rapid back-to-back calls during identify
+
+    uint8_t dwarf = args[0];    // 1-5
+    uint8_t data_len = args[1];
+    uint8_t *data = command_decode_ptr(args[2]);
+
+    // Validate dwarf index
+    if (dwarf < 1 || dwarf > MAX_BRIDGE_DWARFS) {
+        sendf("serial_bridge_read dwarf=%c data=%*s", dwarf, 0, (uint8_t *)0);
+        return;
+    }
+    uint8_t idx = dwarf - 1;
+    uint8_t addr_byte = 0x80 | dwarf;  // Wire address (0x81-0x85)
+
+    // data_len == 0: read-only poll — return any pending RX data
+    // from a previous capture that exceeded one response chunk
+    if (data_len == 0) {
+        uint8_t pending = serial_bridge[idx].rx_pos - serial_bridge[idx].rx_sent;
+        if (pending > 54) pending = 54;
+        sendf("serial_bridge_read dwarf=%c data=%*s", dwarf, pending,
+              serial_bridge[idx].rx_buf + serial_bridge[idx].rx_sent);
+        serial_bridge[idx].rx_sent += pending;
+        if (serial_bridge[idx].rx_sent >= serial_bridge[idx].rx_pos) {
+            serial_bridge[idx].rx_pos = 0;
+            serial_bridge[idx].rx_sent = 0;
+        }
+        return;
+    }
+
+    // Atomic bus claim: wait for idle then claim with IRQ disabled
+    uint32_t wait_start = timer_read_time();
+    while (1) {
+        irq_disable();
+        if (modbus.state == 0) {
+            modbus.state = 4;  // Bridge owns bus
+            irq_enable();
+            break;
+        }
+        irq_enable();
+        if (timer_read_time() - wait_start > timer_from_us(50000)) {
+            sendf("serial_bridge_read dwarf=%c data=%*s",
+                  dwarf, 0, serial_bridge[idx].rx_buf);
+            return;
+        }
+    }
+
+    // Wait for inter-frame gap (1ms).
+    // This creates the idle period that Dwarf USART idle line detection
+    // needs to wake all Dwarfs from mute before the address byte.
+    // 1ms = ~23 character times at 230400 baud — well above minimum.
+    while (timer_read_time() - modbus.last_activity < timer_from_us(1000)) {}
+
+    // Disable USART IRQ to prevent MODBUS ISR from touching DR
+    NVIC_DisableIRQ(MODBUS_USART_IRQn);
+
+    // Bus quiet check: verify no Dwarf is still transmitting.
+    // With tx_allowed gating on Dwarfs, a previously-addressed Dwarf
+    // may still be finishing its last byte when we want to send to a
+    // new target.  Wait for 200us of actual silence (no RXNE) to
+    // avoid bus collision.  Max wait 3ms.
+    {
+        uint32_t quiet_start = timer_read_time();
+        uint32_t quiet_limit = quiet_start + timer_from_us(3000);
+        while (1) {
+            if (MODBUS_USART->SR & USART_SR_RXNE) {
+                (void)MODBUS_USART->DR;  // Discard stray byte
+                quiet_start = timer_read_time();
+            }
+            uint32_t now = timer_read_time();
+            if (now - quiet_start > timer_from_us(200))
+                break;  // 200us silence = bus quiet
+            if (now > quiet_limit)
+                break;  // Timeout
+        }
+    }
+
+    // Flush any remaining stale UART data + clear error flags
+    while (MODBUS_USART->SR & USART_SR_RXNE)
+        (void)MODBUS_USART->DR;
+    (void)MODBUS_USART->SR;
+    (void)MODBUS_USART->DR;
+
+    // TX: send address byte first, then Klipper frame data.
+    // No gap between address and data — they are one continuous
+    // transmission.  The addressed Dwarf stays awake after matching
+    // the address byte and processes all subsequent bytes.
+    rs485_tx_enable();
+    delay_us(10);
+
+    // Address byte (wakes all Dwarfs, only matching one stays awake)
+    while (!(MODBUS_USART->SR & USART_SR_TXE)) {}
+    MODBUS_USART->DR = addr_byte;
+
+    // Send accumulated data from bridge_append (if any)
+    for (uint8_t i = 0; i < serial_bridge[idx].tx_pos; i++) {
+        while (!(MODBUS_USART->SR & USART_SR_TXE)) {}
+        MODBUS_USART->DR = serial_bridge[idx].tx_buf[i];
+    }
+    serial_bridge[idx].tx_pos = 0;
+
+    // Klipper frame data (remainder from this command)
+    for (uint8_t i = 0; i < data_len; i++) {
+        while (!(MODBUS_USART->SR & USART_SR_TXE)) {}
+        MODBUS_USART->DR = data[i];
+    }
+
+    // Wait for transmission complete
+    while (!(MODBUS_USART->SR & USART_SR_TC)) {}
+
+    // Switch to RX mode
+    rs485_rx_enable();
+    delay_us(10);
+
+    // Flush echo bytes (RS485 half-duplex: we receive our own TX).
+    //
+    // During TX of N bytes, the USART receiver sees all N echo bytes.
+    // STM32F4 USART has no FIFO — only DR (1 byte) + shift register.
+    // With overrun: DR holds the FIRST echo byte (never read), shift
+    // register holds the LAST (all intermediate bytes were lost to ORE).
+    // At TC, the last echo byte is fully received (TX and RX are
+    // synchronous on the same APB clock, bus propagation is ~ns).
+    //
+    // First pass: drain DR (first echo) + shift register byte (last echo).
+    // Reading SR then DR clears ORE, letting the shift register byte
+    // move to DR on the next read.
+    while (MODBUS_USART->SR & USART_SR_RXNE)
+        (void)MODBUS_USART->DR;
+    // Clear ORE explicitly (read SR then DR) in case the loop above
+    // exited before ORE was cleared.
+    (void)MODBUS_USART->SR;
+    (void)MODBUS_USART->DR;
+    // Drain any final byte that moved from shift register after ORE clear.
+    while (MODBUS_USART->SR & USART_SR_RXNE)
+        (void)MODBUS_USART->DR;
+    //
+    // NOTE: Previous code had delay_us(60) + second drain here.  This
+    // was WRONG — fast Dwarf responses (get_clock: ~63us turnaround)
+    // had their first byte arrive during the 60us window and get
+    // discarded by the second drain.  The first pass already handles
+    // all echo bytes since they complete by TC.  No delay needed.
+
+    // Keep watchdog alive before blocking RX poll
+    watchdog_reset();
+
+    // Disable USB IRQ during RX poll to prevent byte overrun.
+    // USB ISR (priority 1) can preempt this polling loop; at 230400
+    // baud each byte has a 43us window — USB enumeration can exceed
+    // that.  Matches the pattern in send_frame_wait().
+    NVIC_DisableIRQ(OTG_FS_IRQn);
+
+    // Poll for RX response (up to 5ms)
+    serial_bridge[idx].rx_pos = 0;
+    uint32_t rx_start = timer_read_time();
+    uint32_t last_byte_time = rx_start;
+    while (1) {
+        uint32_t now = timer_read_time();
+        if (MODBUS_USART->SR & USART_SR_RXNE) {
+            uint8_t byte = MODBUS_USART->DR;
+            if (serial_bridge[idx].rx_pos < sizeof(serial_bridge[idx].rx_buf))
+                serial_bridge[idx].rx_buf[serial_bridge[idx].rx_pos++] = byte;
+            last_byte_time = now;
+        }
+        // Done: have data + 500us gap (frame complete at 230400 baud)
+        if (serial_bridge[idx].rx_pos > 0
+            && now - last_byte_time > timer_from_us(500))
+            break;
+        // Timeout: 5ms no response at all
+        if (now - rx_start > timer_from_us(5000))
+            break;
+    }
+
+    NVIC_EnableIRQ(OTG_FS_IRQn);
+    modbus.last_activity = timer_read_time();
+    modbus.state = 0;  // Release bus claim
+    NVIC_EnableIRQ(MODBUS_USART_IRQn);
+
+    // Send ALL received data back to host in 54-byte chunks.
+    // Klipper MESSAGE_MAX=64; after response header overhead, 54 bytes
+    // is the maximum payload per sendf.  Previous code truncated at 54,
+    // silently losing the tail of Dwarf responses >54 bytes (typically
+    // a data frame + ACK frame = 55-70 bytes).  The lost bytes caused
+    // frame misalignment in the host serialqueue (bytes_invalid).
+    {
+        uint8_t total = serial_bridge[idx].rx_pos;
+        uint8_t sent = 0;
+        while (sent < total) {
+            uint8_t chunk = total - sent;
+            if (chunk > 54) chunk = 54;
+            sendf("serial_bridge_read dwarf=%c data=%*s",
+                  dwarf, chunk, serial_bridge[idx].rx_buf + sent);
+            sent += chunk;
+        }
+        serial_bridge[idx].rx_sent = total;
+        if (total == 0) {
+            // No response — send empty to unblock host
+            sendf("serial_bridge_read dwarf=%c data=%*s",
+                  dwarf, 0, serial_bridge[idx].rx_buf);
+        }
+    }
+}
+DECL_COMMAND(command_serial_bridge_write,
+             "serial_bridge_write dwarf=%c data=%*s");
+
+// Shutdown handler: restore USART3 state after longjmp() from shutdown.
+// If shutdown() fires while inside command_serial_bridge_write, longjmp
+// unwinds the stack and NVIC_EnableIRQ(MODBUS_USART_IRQn) is never reached.
+// Without this, USART3 IRQ stays disabled permanently, killing all MODBUS.
+void serial_bridge_shutdown(void)
+{
+    NVIC_EnableIRQ(MODBUS_USART_IRQn);
+    NVIC_EnableIRQ(OTG_FS_IRQn);
+    rs485_rx_enable();
+    MODBUS_USART->CR1 &= ~(USART_CR1_TXEIE | USART_CR1_TCIE);
+    (void)MODBUS_USART->SR;
+    (void)MODBUS_USART->DR;
+    modbus.state = 0;
+    for (int i = 0; i < MAX_BRIDGE_DWARFS; i++) {
+        serial_bridge[i].rx_pos = 0;
+        serial_bridge[i].rx_sent = 0;
+        serial_bridge[i].tx_pos = 0;
+    }
+}
+DECL_SHUTDOWN(serial_bridge_shutdown);
+
+/****************************************************************
+ * Dwarf Flash Commands - Flash Klipper firmware to Dwarf via
+ * the Prusa bootloader protocol (WRITE_FLASH / FINALIZE_FLASH)
+ ****************************************************************/
+
+#define BOOTLOADER_CMD_WRITE_FLASH       0x06
+#define BOOTLOADER_CMD_FINALIZE_FLASH    0x07
+
+// Flash a chunk of data to a Dwarf in bootloader mode
+// address: bootloader address (0x0A-0x0E)
+// offset: byte offset in flash (from app start 0x08002000)
+// data: firmware bytes (up to 247 bytes per chunk)
+void command_dwarf_flash_chunk(uint32_t *args)
+{
+    uint8_t addr = args[0];
+    uint32_t offset = args[1];
+    uint8_t data_len = args[2];
+    uint8_t *data = command_decode_ptr(args[3]);
+
+    // Build WRITE_FLASH frame: [addr][0x06][offset_4B_BE][data...][crc16]
+    uint8_t frame[256];
+    frame[0] = addr;
+    frame[1] = BOOTLOADER_CMD_WRITE_FLASH;
+    // Offset is big-endian
+    frame[2] = (offset >> 24) & 0xFF;
+    frame[3] = (offset >> 16) & 0xFF;
+    frame[4] = (offset >> 8) & 0xFF;
+    frame[5] = offset & 0xFF;
+    if (data_len > 247) data_len = 247;
+    memcpy(&frame[6], data, data_len);
+
+    uint16_t frame_len = 6 + data_len;
+    uint16_t crc = calc_crc16(frame, frame_len);
+    frame[frame_len] = crc & 0xFF;
+    frame[frame_len + 1] = (crc >> 8) & 0xFF;
+    frame_len += 2;
+
+    uint8_t response[32];
+    uint16_t resp_len = 0;
+
+    int ret = send_frame_wait(frame, frame_len, response, &resp_len,
+                              sizeof(response), BOOTLOADER_TIMEOUT_MS, 1);
+
+    uint8_t status = 0xFF;
+    if (ret == MODBUS_OK && resp_len >= 5) {
+        status = response[1];  // Bootloader status byte
+    }
+    sendf("dwarf_flash_response status=%c offset=%u", status, offset);
+}
+DECL_COMMAND(command_dwarf_flash_chunk,
+             "dwarf_flash_chunk address=%c offset=%u data=%*s");
+
+// Finalize flash on a Dwarf (triggers flash erase and program)
+void command_dwarf_flash_finalize(uint32_t *args)
+{
+    uint8_t addr = args[0];
+
+    // Build FINALIZE_FLASH frame: [addr][0x07][crc16]
+    uint8_t frame[8];
+    frame[0] = addr;
+    frame[1] = BOOTLOADER_CMD_FINALIZE_FLASH;
+    uint16_t crc = calc_crc16(frame, 2);
+    frame[2] = crc & 0xFF;
+    frame[3] = (crc >> 8) & 0xFF;
+
+    uint8_t response[32];
+    uint16_t resp_len = 0;
+
+    // Finalize can take a while (flash erase)
+    int ret = send_frame_wait(frame, 4, response, &resp_len,
+                              sizeof(response), BOOTLOADER_TIMEOUT_MS, 1);
+
+    uint8_t status = 0xFF;
+    if (ret == MODBUS_OK && resp_len >= 5) {
+        status = response[1];
+    }
+    sendf("dwarf_flash_finalize_response status=%c", status);
+}
+DECL_COMMAND(command_dwarf_flash_finalize, "dwarf_flash_finalize address=%c");
+
+/****************************************************************
+ * Buffered Flash Commands - Bypass MESSAGE_MAX=64 limit
+ *
+ * Klipper's USB protocol limits messages to 64 bytes, but the
+ * Prusa bootloader expects ~247-byte WRITE_FLASH frames.
+ * Solution: accumulate data on the MCU in a static buffer via
+ * multiple small "load" commands, then build and send the full
+ * RS485 frame with a single "send" command.
+ ****************************************************************/
+
+static struct {
+    uint8_t buf[256];   // Accumulation buffer for flash data
+    uint16_t pos;       // Current write position
+    // Cached last-send result for retransmit idempotency
+    uint8_t last_status;
+    uint32_t last_offset;
+    uint16_t last_len;
+} flash_buf;
+
+// Append data to the flash buffer (multiple calls to fill it)
+// Returns current buffer position so host can verify
+void command_dwarf_flash_load(uint32_t *args)
+{
+    uint8_t data_len = args[0];
+    uint8_t *data = command_decode_ptr(args[1]);
+
+    uint16_t space = sizeof(flash_buf.buf) - flash_buf.pos;
+    if (data_len > space)
+        data_len = space;
+
+    memcpy(&flash_buf.buf[flash_buf.pos], data, data_len);
+    flash_buf.pos += data_len;
+
+    sendf("dwarf_flash_load_response pos=%u", flash_buf.pos);
+}
+DECL_COMMAND(command_dwarf_flash_load, "dwarf_flash_load data=%*s");
+
+// Build WRITE_FLASH frame from buffer and send on RS485
+// Uses all data accumulated via dwarf_flash_load calls.
+// Retransmit-safe: if buffer is empty (already sent), returns cached result.
+void command_dwarf_flash_send(uint32_t *args)
+{
+    uint8_t addr = args[0];
+    uint32_t offset = args[1];
+
+    // Retransmit detection: buffer empty means we already sent this chunk
+    if (flash_buf.pos == 0) {
+        sendf("dwarf_flash_send_response status=%c offset=%u len=%u",
+              flash_buf.last_status, flash_buf.last_offset,
+              flash_buf.last_len);
+        return;
+    }
+
+    uint16_t data_len = flash_buf.pos;
+    if (data_len > 247) data_len = 247;  // Prusa max
+
+    // Build WRITE_FLASH frame: [addr][0x06][offset_4B_BE][data...][crc16]
+    uint8_t frame[256];
+    frame[0] = addr;
+    frame[1] = BOOTLOADER_CMD_WRITE_FLASH;
+    frame[2] = (offset >> 24) & 0xFF;
+    frame[3] = (offset >> 16) & 0xFF;
+    frame[4] = (offset >> 8) & 0xFF;
+    frame[5] = offset & 0xFF;
+    memcpy(&frame[6], flash_buf.buf, data_len);
+
+    uint16_t frame_len = 6 + data_len;
+    uint16_t crc = calc_crc16(frame, frame_len);
+    frame[frame_len] = crc & 0xFF;
+    frame[frame_len + 1] = (crc >> 8) & 0xFF;
+    frame_len += 2;
+
+    // Clear buffer — next load sequence will refill it
+    flash_buf.pos = 0;
+
+    uint8_t response[32];
+    uint16_t resp_len = 0;
+
+    int ret = send_frame_wait(frame, frame_len, response, &resp_len,
+                              sizeof(response), BOOTLOADER_TIMEOUT_MS, 1);
+
+    uint8_t status = 0xFF;
+    if (ret == MODBUS_OK && resp_len >= 5) {
+        status = response[1];
+    }
+
+    // Cache result for retransmit idempotency
+    flash_buf.last_status = status;
+    flash_buf.last_offset = offset;
+    flash_buf.last_len = data_len;
+
+    sendf("dwarf_flash_send_response status=%c offset=%u len=%u",
+          status, offset, data_len);
+}
+DECL_COMMAND(command_dwarf_flash_send,
+             "dwarf_flash_send address=%c offset=%u");
+
+// Reset flash buffer (call before starting a new flash sequence)
+void command_dwarf_flash_buf_reset(uint32_t *args)
+{
+    flash_buf.pos = 0;
+    sendf("dwarf_flash_buf_reset_response pos=%u", flash_buf.pos);
+}
+DECL_COMMAND(command_dwarf_flash_buf_reset, "dwarf_flash_buf_reset");
+
+#define BOOTLOADER_CMD_READ_FLASH        0x08
+
+// Read a chunk of flash from a Dwarf in bootloader mode
+// READ_FLASH frame: [addr][0x08][offset_4B_BE][len_1B][crc16]
+// Response: [addr][status][resp_len][data...][crc16]
+void command_dwarf_read_flash(uint32_t *args)
+{
+    uint8_t addr = args[0];
+    uint32_t offset = args[1];
+    uint8_t read_len = args[2];
+
+    if (read_len > 128) read_len = 128;  // Cap to safe size for response
+
+    // Build READ_FLASH frame
+    uint8_t frame[16];
+    frame[0] = addr;
+    frame[1] = BOOTLOADER_CMD_READ_FLASH;
+    frame[2] = (offset >> 24) & 0xFF;
+    frame[3] = (offset >> 16) & 0xFF;
+    frame[4] = (offset >> 8) & 0xFF;
+    frame[5] = offset & 0xFF;
+    frame[6] = read_len;
+
+    uint16_t frame_len = 7;
+    uint16_t crc = calc_crc16(frame, frame_len);
+    frame[frame_len] = crc & 0xFF;
+    frame[frame_len + 1] = (crc >> 8) & 0xFF;
+    frame_len += 2;
+
+    uint8_t response[192];
+    uint16_t resp_len = 0;
+
+    int ret = send_frame_wait(frame, frame_len, response, &resp_len,
+                              sizeof(response), BOOTLOADER_TIMEOUT_MS, 1);
+
+    uint8_t status = 0xFF;
+    uint8_t data_len = 0;
+    uint8_t *data_ptr = response;
+
+    if (ret == MODBUS_OK && resp_len >= 5) {
+        status = response[1];
+        data_len = response[2];
+        data_ptr = &response[3];
+        // Cap data_len to what we actually received (minus header + crc)
+        if (data_len > resp_len - 5) data_len = resp_len - 5;
+        // Cap to MESSAGE_MAX safe size
+        if (data_len > 50) data_len = 50;
+    }
+    sendf("dwarf_read_flash_response status=%c offset=%u data=%*s",
+          status, offset, data_len, data_ptr);
+}
+DECL_COMMAND(command_dwarf_read_flash,
+             "dwarf_read_flash address=%c offset=%u len=%c");
+
+// Reset a single Dwarf via PCA9557 (hold in reset, then release)
+void command_dwarf_reset(uint32_t *args)
+{
+    uint8_t dwarf_num = args[0];  // 1-5
+    if (dwarf_num < 1 || dwarf_num > 5) {
+        sendf("dwarf_reset_response status=%c", 0xFF);
+        return;
+    }
+
+    uint8_t bit = dwarf_reset_bit(dwarf_num);
+
+    // Hold target Dwarf in reset
+    hw_i2c_write(PCA9557_ADDR, PCA9557_REG_OUTPUT, bit);
+    delay_ms(10);
+
+    // Release from reset (back to bootloader)
+    hw_i2c_write(PCA9557_ADDR, PCA9557_REG_OUTPUT, 0x00);
+    delay_ms(50);
+
+    sendf("dwarf_reset_response status=%c", 0);
+}
+DECL_COMMAND(command_dwarf_reset, "dwarf_reset dwarf=%c");
