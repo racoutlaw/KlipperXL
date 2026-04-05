@@ -422,9 +422,11 @@ The LED configuration is already included in the printer.cfg (`[neopixel side_le
 Status macros are wired into START_PRINT, END_PRINT, PAUSE, RESUME, and CANCEL_PRINT.
 
 **LED Notes:**
-- Color order is **RGBW** with `chain_count: 1`
-- White channel controls the dedicated white LED
+- Color order is **RGB** with `chain_count: 2` — two daisy-chained WS2812 drivers per strip:
+  - **Index 1:** RGB color (effects target this with `neopixel:side_leds (1)`)
+  - **Index 2:** White LED on Red channel (effects target this with `neopixel:side_leds (2)`)
 - Mux select pin PE9 is held HIGH via `[static_digital_output led_mux_select]`
+- To set white manually: `SET_LED LED=side_leds INDEX=2 RED=0.5`
 
 ### 8.2 USB Webcam (Crowsnest)
 
