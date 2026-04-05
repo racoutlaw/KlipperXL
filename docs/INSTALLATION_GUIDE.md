@@ -91,7 +91,15 @@ After installation, verify Klipper service:
 sudo systemctl status klipper
 ```
 
-### 2.6 Note Your Pi's IP Address
+### 2.6 Install Python Dependencies
+
+```bash
+~/klippy-env/bin/pip install numpy
+```
+
+numpy is required for input shaper calibration (`CALIBRATE_INPUT_SHAPER`).
+
+### 2.7 Note Your Pi's IP Address
 
 ```bash
 hostname -I

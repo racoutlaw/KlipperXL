@@ -93,7 +93,8 @@ cp "$MODULE_DIR/klippy/loadcell_probe.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/pca9557.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/dwarf_accelerometer.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/tool_offsets.py" ~/klipper/klippy/extras/
-echo "  Done."
+~/klippy-env/bin/pip install numpy -q 2>/dev/null
+echo "  Done (numpy installed for input shaper)."
 
 # Step 3: Deploy config files
 echo ""
