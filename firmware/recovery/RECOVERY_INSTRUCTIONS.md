@@ -1,111 +1,130 @@
-# Prusa XL XLBuddy DFU Recovery
+# Prusa XL Recovery — Restoring Stock Firmware
 
-Use this if your XLBuddy is bricked (blank screen, won't boot) after a bad flash.
+How to restore your Prusa XL to stock Prusa firmware from KlipperXL.
 
-## Files Included
+Choose the section that matches how you installed KlipperXL.
 
-- `firmware.bin` - Prusa XL stock firmware (noboot version, ~1.8MB)
-- `firmware.bbf` - Resource file (copy to USB drive if XL shows "Looking for BBF")
+---
 
-These binaries are from [Prusa-Firmware-Buddy](https://github.com/prusa3d/Prusa-Firmware-Buddy),
-licensed under GPLv3. Source code is available at: https://github.com/prusa3d/Prusa-Firmware-Buddy
+## Recovery WITH Prusa Bootloader (USB Drive Method)
 
-## Requirements
+If you installed KlipperXL using the USB drive method (bootloader offset 0x08020200), the Prusa bootloader is still intact. Recovery is simple:
+
+### Steps
+
+1. Download the latest XL firmware from [Prusa Downloads](https://www.prusa3d.com/page/firmware-and-software_541542/)
+2. Copy the `.bbf` file to a FAT32 USB drive
+3. Plug the USB drive into the printer
+4. Power cycle the printer
+5. The bootloader will flash the stock firmware and update all Dwarfs
+6. Done — your printer is back to stock Prusa
+
+---
+
+## Recovery WITHOUT Prusa Bootloader (DFU Method)
+
+If you installed KlipperXL using the DFU method (no bootloader, flashed at 0x08000000), the Prusa bootloader was overwritten. Recovery requires two steps: restoring the bootloader, then flashing stock firmware.
+
+### Requirements
 
 - Raspberry Pi (or any Linux machine) with `dfu-util` installed
 - USB cable from Pi to XLBuddy
-- DFU jumper location on XLBuddy board
+- Physical access to the BOOT0 jumper on the XLBuddy board
 
-## Recovery Steps
+### Files Included
 
-### 1. Copy firmware.bin to your Pi
+| File | Purpose |
+|------|---------|
+| `bootloader-xl-2.5.0.bin` | Prusa XL bootloader (131KB, flashed to 0x08000000) |
+| `XL_firmware_6.4.0.bbf` | Stock Prusa XL firmware (for USB drive recovery) |
+| `firmware.bin` | Prusa XL firmware, noboot version (for DFU emergency recovery) |
 
-From Windows PowerShell:
-```powershell
-scp firmware.bin pi@YOUR_PI_IP:~/
-```
+**Note:** You can also download the latest firmware from [Prusa Downloads](https://www.prusa3d.com/page/firmware-and-software_541542/) if a newer version is available.
 
-### 2. SSH into your Pi
-
-```powershell
-ssh pi@YOUR_PI_IP
-```
-
-### 3. Install dfu-util (if not already installed)
-
-```bash
-sudo apt update && sudo apt install dfu-util -y
-```
-
-### 4. Put XLBuddy in DFU Mode
+### Step 1: Flash the Bootloader via DFU
 
 1. **Power OFF** the printer completely
-2. **Add the DFU jumper** on the XLBuddy board
-3. **Power ON** the printer (screen stays off - this is normal)
-4. **Connect USB cable** from Pi to XLBuddy
+2. **Install the BOOT0 jumper** on the XLBuddy board
+3. **Connect USB cable** from Pi to XLBuddy
+4. **Power ON** the printer (screen stays off — this is normal)
 
-### 5. Verify DFU Device is Detected
-
+On the Pi:
 ```bash
+sudo apt install dfu-util -y
+
+# Verify DFU device is detected
 sudo dfu-util -l
 ```
 
 You should see output containing `[0483:df11]` and `@Internal Flash /0x08000000/...`
 
-If not detected:
-- Check USB cable connection
-- Verify DFU jumper is installed correctly
-- Try a different USB port
-
-### 6. Flash the Firmware
-
+Flash the bootloader:
 ```bash
-sudo dfu-util -a 0 -s 0x08000000:leave -D ~/firmware.bin
+sudo dfu-util -a 0 -s 0x08000000 -D bootloader-xl-2.5.0.bin
 ```
 
-Wait for it to complete (30-60 seconds). You should see:
+Wait for it to complete. You should see:
 ```
-Erase           [=========================] 100%
-Download        [=========================] 100%
+Download done.
 File downloaded successfully
 ```
 
-### 7. Exit DFU Mode and Boot
+### Step 2: Remove Jumper and Boot
 
 1. **Power OFF** the printer
-2. **Remove the DFU jumper**
+2. **Remove the BOOT0 jumper**
 3. **Power ON** the printer
 
-### 8. If Screen Shows "Looking for BBF"
+The Prusa bootloader logo should appear. It may show "Firmware corrupted" — this is expected since there's no application firmware yet.
 
-1. Copy `firmware.bbf` to a USB drive
-2. Insert USB drive into the XL
-3. It will find and install the resources automatically
+### Step 3: Flash Stock Prusa Firmware via USB
+
+1. Download the latest XL firmware `.bbf` from [Prusa Downloads](https://www.prusa3d.com/page/firmware-and-software_541542/)
+2. Copy the `.bbf` file to a FAT32 USB drive
+3. Plug the USB drive into the printer
+4. The bootloader will detect and flash the firmware
+5. All Dwarfs (toolheads) will be updated automatically
+6. Once complete, the printer boots to the stock Prusa home screen
+
+---
+
+## Emergency DFU Recovery (No Bootloader, No USB)
+
+If the bootloader is missing AND you can't use USB, you can flash the noboot firmware directly:
+
+```bash
+sudo dfu-util -a 0 -s 0x08000000:leave -D firmware.bin
+```
+
+This flashes stock Prusa firmware without a bootloader. The printer will run but won't have USB drive update capability. To restore full functionality, follow the full recovery procedure above.
+
+---
 
 ## Troubleshooting
 
 ### "No DFU capable USB device available"
-- DFU jumper not installed or in wrong position
+- BOOT0 jumper not installed or in wrong position
 - USB cable not connected or faulty
-- Try different USB port on Pi
+- Try a different USB port on the Pi
+
+### Screen shows "Firmware corrupted"
+- Expected after flashing only the bootloader — proceed to flash firmware via USB drive
+
+### "Looking for BBF" stuck
+- Copy the latest Prusa firmware `.bbf` to a USB drive and plug it in
 
 ### Flashing completes but XL still won't boot
-- Make sure you removed the DFU jumper before powering on
+- Make sure the BOOT0 jumper is REMOVED before powering on
 - Try the recovery process again
 
-### "Looking for BBF" stuck forever
-- Copy the firmware.bbf file to USB drive
-- Or download latest XL firmware from Prusa website
+---
 
 ## Technical Details
 
 - MCU: STM32F407 (168MHz ARM Cortex-M4)
-- Flash Address: 0x08000000 (no bootloader offset)
-- Firmware Type: xl_release_noboot
+- Bootloader address: 0x08000000 (128KB)
+- Application address: 0x08020200 (after bootloader + descriptor)
 - DFU Device ID: 0483:df11
+- Bootloader source: [Prusa S3 downloads](https://prusa-buddy-firmware-dependencies.s3.eu-central-1.amazonaws.com/)
 
-## Notes
-
-- This firmware has NO bootloader - it's flashed directly at 0x08000000
-- The XLBuddy uses a **jumper** for DFU mode (not a button)
-- Keep this recovery package handy when experimenting with custom firmware
+These binaries are from [Prusa-Firmware-Buddy](https://github.com/prusa3d/Prusa-Firmware-Buddy), licensed under GPLv3.
