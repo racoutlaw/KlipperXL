@@ -103,6 +103,8 @@ hostname -I
 
 ### 3.1 Clone the KlipperXL Repository
 
+KIAUH already cloned Klipper to `~/klipper` in the previous step. Now clone KlipperXL:
+
 ```bash
 cd ~
 git clone https://github.com/racoutlaw/KlipperXL.git
@@ -208,7 +210,31 @@ mkdir -p ~/printer_data/config/macros
 cp ~/KlipperXL/config/macros/print_macros.cfg ~/printer_data/config/macros/print_macros.cfg
 ```
 
-### 5.2 Update Serial Port in printer.cfg
+### 5.2 Fix Config Includes
+
+The default printer.cfg includes files that may not exist on your setup. Edit it:
+
+```bash
+nano ~/printer_data/config/printer.cfg
+```
+
+**If you installed Fluidd instead of Mainsail**, find and change:
+```
+[include mainsail.cfg]
+```
+to:
+```
+[include fluidd.cfg]
+```
+
+**If you are NOT using side LED strips**, comment out:
+```
+#[include led_effects.cfg]
+```
+
+Save and exit (`Ctrl+O`, Enter, `Ctrl+X`).
+
+### 5.3 Update Serial Port in printer.cfg
 
 **Note:** You will update this after flashing the XLBuddy in the next step. For now, leave it as-is.
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# KlipperXL - MODBUS Master Installation Script for Prusa XL
+# KlipperXL - Installation Script for Prusa XL
 # Copyright (C) 2026 Richard Crook
 #
 # This program is free software: you can redistribute it and/or modify
@@ -7,21 +7,24 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# Run this on your Raspberry Pi
+# Run this on your Raspberry Pi after installing Klipper via KIAUH
+# and cloning the KlipperXL repo to ~/KlipperXL
 #
-# Usage: ./INSTALL_ON_PI.sh
+# Usage: bash ~/KlipperXL/scripts/INSTALL_ON_PI.sh
 #
 # This will:
-# 1. Clone/update Klipper
-# 2. Copy MODBUS module files
-# 3. Build firmware for XLBuddy
-# 4. Generate flashable .bin file
+# 1. Check prerequisites
+# 2. Copy MODBUS module to Klipper source
+# 3. Copy Python extras to Klipper
+# 4. Patch the STM32 Makefile
+# 5. Launch make menuconfig for build setup
+# 6. Build firmware
 
 set -e
 
 echo "=========================================="
-echo " Klipper MODBUS Master for Prusa XL"
-echo " Installation Script"
+echo " KlipperXL Installation Script"
+echo " for Prusa XL with XLBuddy"
 echo "=========================================="
 echo ""
 
@@ -56,7 +59,7 @@ if [ -n "$MISSING" ]; then
     echo "  git clone https://github.com/dw-0/kiauh.git"
     echo "  ./kiauh/kiauh.sh"
     echo ""
-    echo "Install Klipper, Moonraker, and Mainsail, then re-run this script."
+    echo "Install Klipper, Moonraker, and Mainsail/Fluidd, then re-run this script."
     echo ""
     echo "For build tools, run:"
     echo "  sudo apt install build-essential gcc-arm-none-eabi"
@@ -66,89 +69,91 @@ fi
 echo "Klipper installation found, proceeding..."
 echo ""
 
-cd ~
-
-# Step 2: Copy MODBUS module files
-echo ""
-echo "[2/5] Installing MODBUS module..."
-
 # Determine where our module files are
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODULE_DIR="$(dirname "$SCRIPT_DIR")"
 
 if [ ! -f "$MODULE_DIR/src/modbus_stm32f4.c" ]; then
     echo "ERROR: Cannot find src/modbus_stm32f4.c in $MODULE_DIR"
-    echo "Make sure you're running this from the KlipperXL directory"
+    echo "Make sure KlipperXL is cloned to ~/KlipperXL"
     exit 1
 fi
 
-# Copy MCU code
-echo "Copying modbus_stm32f4.c to klipper/src/"
+# Step 1: Copy MODBUS MCU module
+echo "[1/6] Copying MODBUS module to Klipper source..."
 cp "$MODULE_DIR/src/modbus_stm32f4.c" ~/klipper/src/
+echo "  Done."
 
-# Copy Python module
-echo "Copying modbus_master.py to klipper/klippy/extras/"
+# Step 2: Copy Python extras
+echo ""
+echo "[2/6] Copying Python extras to Klipper..."
 cp "$MODULE_DIR/klippy/modbus_master.py" ~/klipper/klippy/extras/
+cp "$MODULE_DIR/klippy/puppy_bootloader.py" ~/klipper/klippy/extras/
+cp "$MODULE_DIR/klippy/loadcell_probe.py" ~/klipper/klippy/extras/
+cp "$MODULE_DIR/klippy/pca9557.py" ~/klipper/klippy/extras/
+cp "$MODULE_DIR/klippy/dwarf_accelerometer.py" ~/klipper/klippy/extras/
+cp "$MODULE_DIR/klippy/tool_offsets.py" ~/klipper/klippy/extras/
+echo "  Done."
 
-echo "Module files installed!"
-
-# Step 3: Create menuconfig preset
+# Step 3: Deploy config files
 echo ""
-echo "[3/5] Creating build configuration..."
-
-cat > ~/klipper/.config << 'EOF'
-#
-# Klipper config for Prusa XL XLBuddy (STM32F407)
-#
-CONFIG_LOW_LEVEL_OPTIONS=y
-CONFIG_MACH_STM32=y
-CONFIG_MACH_STM32F407=y
-CONFIG_MACH_STM32F4=y
-CONFIG_CLOCK_FREQ=168000000
-CONFIG_FLASH_SIZE=0x100000
-CONFIG_RAM_START=0x20000000
-CONFIG_RAM_SIZE=0x20000
-CONFIG_STACK_SIZE=512
-CONFIG_STM32_CLOCK_REF_8M=y
-CONFIG_USBSERIAL=y
-CONFIG_USB_VENDOR_ID=0x1d50
-CONFIG_USB_DEVICE_ID=0x614e
-CONFIG_USB_SERIAL_NUMBER="XLBuddy"
-CONFIG_CANBUS_FREQUENCY=1000000
-CONFIG_INITIAL_PINS=""
-CONFIG_HAVE_GPIO=y
-CONFIG_HAVE_GPIO_ADC=y
-CONFIG_HAVE_GPIO_SPI=y
-CONFIG_HAVE_GPIO_I2C=y
-CONFIG_HAVE_GPIO_BITBANGING=y
-CONFIG_HAVE_STRICT_TIMING=y
-CONFIG_INLINE_STEPPER_HACK=y
-EOF
-
-echo "Build config created!"
-
-# Step 4: Add MODBUS to Makefile
+echo "[3/6] Deploying configuration files..."
+cp "$MODULE_DIR/config/printer.cfg" ~/printer_data/config/printer.cfg
+cp "$MODULE_DIR/config/tool_offsets.cfg" ~/printer_data/config/tool_offsets.cfg
+cp "$MODULE_DIR/config/variables.cfg" ~/printer_data/config/variables.cfg
+mkdir -p ~/printer_data/config/macros
+cp "$MODULE_DIR/config/macros/print_macros.cfg" ~/printer_data/config/macros/print_macros.cfg
+echo "  Done."
 echo ""
-echo "[4/5] Patching Makefile..."
+echo "  NOTE: Edit ~/printer_data/config/printer.cfg to:"
+echo "    - Change [include mainsail.cfg] to [include fluidd.cfg] if using Fluidd"
+echo "    - Comment out [include led_effects.cfg] if not using side LED strips"
 
-MAKEFILE=~/klipper/src/Makefile
+# Step 4: Patch STM32 Makefile
+echo ""
+echo "[4/6] Patching STM32 Makefile..."
 
-# Check if already patched
-if grep -q "modbus_stm32f4" "$MAKEFILE"; then
-    echo "Makefile already patched"
+STM32_MK=~/klipper/src/stm32/Makefile
+
+if grep -q "modbus_stm32f4" "$STM32_MK"; then
+    echo "  Already patched, skipping."
 else
-    # Add modbus_stm32f4.c to the build
-    sed -i '/src-\$(CONFIG_MACH_STM32F4) += stm32f4.c/a src-$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c' "$MAKEFILE"
-    echo "Makefile patched!"
+    sed -i '/^src-\$(CONFIG_MACH_STM32F4) += stm32\/stm32f4.c/a src-$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c' "$STM32_MK"
+    if grep -q "modbus_stm32f4" "$STM32_MK"; then
+        echo "  Done."
+    else
+        echo "  WARNING: Automatic patching failed."
+        echo "  Please manually edit ~/klipper/src/stm32/Makefile"
+        echo "  Find the line: src-\$(CONFIG_MACH_STM32F4) += stm32/stm32f4.c ..."
+        echo "  Add below it:  src-\$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c"
+    fi
 fi
 
-# Step 5: Build
+# Step 5: Configure build via menuconfig
 echo ""
-echo "[5/5] Building firmware..."
+echo "[5/6] Build configuration..."
+echo ""
+echo "  make menuconfig will now launch. Set these options:"
+echo "    - Micro-controller Architecture: STMicroelectronics STM32"
+echo "    - Processor model: STM32F407"
+echo "    - Bootloader offset: No bootloader"
+echo "    - Clock Reference: 12 MHz crystal"
+echo "    - Communication interface: USB (on PA11/PA12)"
+echo "    - USB ids: 0x1d50 / 0x614e"
+echo ""
+echo "  Save and exit when done."
+echo ""
+read -p "  Press Enter to launch menuconfig..."
 
 cd ~/klipper
+make menuconfig
+
+# Step 6: Build
+echo ""
+echo "[6/6] Building firmware..."
+
 make clean
-make
+make -j4
 
 echo ""
 echo "=========================================="
@@ -157,21 +162,28 @@ echo "=========================================="
 echo ""
 echo "Firmware location: ~/klipper/out/klipper.bin"
 echo ""
-echo "To flash to XLBuddy:"
+echo "Next steps:"
 echo ""
-echo "Option A - DFU Mode (requires USB connection):"
-echo "  1. Hold BOOT button on XLBuddy"
-echo "  2. Power on printer"
-echo "  3. Run: cd ~/klipper && make flash FLASH_DEVICE=0483:df11"
+echo "  1. Fix config includes (if not done already):"
+echo "     nano ~/printer_data/config/printer.cfg"
 echo ""
-echo "Option B - USB Drive:"
-echo "  1. Copy ~/klipper/out/klipper.bin to USB drive"
-echo "  2. Rename to firmware.bbf (or use pack_fw.py)"
-echo "  3. Insert USB into XLBuddy"
-echo "  4. Printer should detect and flash"
+echo "  2. Flash the XLBuddy via DFU:"
+echo "     - Power OFF printer"
+echo "     - Install BOOT0 jumper on XLBuddy"
+echo "     - Connect USB to Pi, power ON"
+echo "     - sudo apt install dfu-util -y"
+echo "     - sudo dfu-util -l  (verify device detected)"
+echo "     - sudo dfu-util -a 0 -s 0x08000000:leave -D ~/klipper/out/klipper.bin"
+echo "     - Power OFF, remove BOOT0 jumper, power ON"
 echo ""
-echo "After flashing, update your printer.cfg with the"
-echo "[modbus_master] and [prusa_dwarf] sections."
+echo "  3. Update serial port in printer.cfg:"
+echo "     ls /dev/serial/by-id/"
+echo "     nano ~/printer_data/config/printer.cfg"
 echo ""
-echo "See printer.cfg.example for a complete configuration."
+echo "  4. Fix Klipper dirty state:"
+echo "     bash ~/KlipperXL/scripts/fix_klipper_dirty.sh"
+echo "     sudo systemctl restart moonraker"
+echo ""
+echo "  5. Restart Klipper:"
+echo "     sudo systemctl restart klipper"
 echo ""
