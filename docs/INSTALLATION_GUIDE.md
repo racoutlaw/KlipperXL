@@ -101,24 +101,24 @@ Example: `<YOUR_PI_IP>`
 
 ---
 
-## 3. Extract KlipperXL Package
+## 3. Clone KlipperXL and Klipper
 
 On your **build computer** (WSL/Linux), not the Pi:
 
-### 3.1 Extract the Package
+### 3.1 Clone the KlipperXL Repository
 
 ```bash
-mkdir -p ~/projects
-cd ~/projects
-tar -xzf KlipperXL_Install_Package_20260206.tar.gz
-cd KlipperXL_Install_Package
+cd ~
+git clone https://github.com/racoutlaw/KlipperXL.git
+cd KlipperXL
 ```
 
 You should see these folders:
-- `mcu_firmware/` - MCU source files and build config
-- `python_modules/` - Klipper Python extras
-- `config_files/` - Printer configuration
-- `post_install/` - Post-installation fixes
+- `src/` - MCU source files (modbus_stm32f4.c)
+- `klippy/` - Klipper Python extras
+- `config/` - Printer configuration files
+- `scripts/` - Installation and post-install scripts
+- `firmware/` - Build config and recovery files
 - `orcaslicer/` - Slicer profiles
 
 ### 3.2 Clone Klipper Source (needed for building firmware)
@@ -136,8 +136,8 @@ cd klipper
 ### 4.1 Copy Custom Modules to Klipper Source
 
 ```bash
-# From the KlipperXL_Install_Package directory
-cp mcu_firmware/modbus_stm32f4.c ~/klipper/src/stm32/
+# From the KlipperXL directory
+cp ~/KlipperXL/src/modbus_stm32f4.c ~/klipper/src/stm32/
 ```
 
 ### 4.2 Update Makefiles
@@ -152,7 +152,7 @@ src-y += stm32/modbus_stm32f4.c
 ### 4.3 Copy Klipper Build Configuration
 
 ```bash
-cp mcu_firmware/klipper_config ~/klipper/.config
+cp ~/KlipperXL/firmware/klipper_config ~/klipper/.config
 ```
 
 The config targets STM32F407 (XLBuddy), 12MHz crystal, no bootloader, USB serial.
@@ -228,14 +228,14 @@ You should see something like: `usb-Klipper_stm32f407xx_...`
 Copy all Python extras to the Pi's Klipper installation:
 
 ```bash
-# From the KlipperXL_Install_Package directory
+# From the KlipperXL directory
 PI_IP="<PI_IP>"  # Change to your Pi's IP
 
-scp python_modules/puppy_bootloader.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp python_modules/loadcell_probe.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp python_modules/pca9557.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp python_modules/dwarf_accelerometer.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp python_modules/modbus_master.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
+scp ~/KlipperXL/klippy/puppy_bootloader.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
+scp ~/KlipperXL/klippy/loadcell_probe.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
+scp ~/KlipperXL/klippy/pca9557.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
+scp ~/KlipperXL/klippy/dwarf_accelerometer.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
+scp ~/KlipperXL/klippy/modbus_master.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
 ```
 
 ---
@@ -245,21 +245,21 @@ scp python_modules/modbus_master.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
 ### 7.1 Copy Configuration Files
 
 ```bash
-# From the KlipperXL_Install_Package directory
+# From the KlipperXL directory
 PI_IP="<PI_IP>"  # Change to your Pi's IP
 
 # Main printer.cfg
-scp config_files/printer.cfg pi@${PI_IP}:~/printer_data/config/printer.cfg
+scp ~/KlipperXL/config/printer.cfg pi@${PI_IP}:~/printer_data/config/printer.cfg
 
 # Tool offsets (will need recalibration for your machine)
-scp config_files/tool_offsets.cfg pi@${PI_IP}:~/printer_data/config/tool_offsets.cfg
+scp ~/KlipperXL/config/tool_offsets.cfg pi@${PI_IP}:~/printer_data/config/tool_offsets.cfg
 
 # Variables file
-scp config_files/variables.cfg pi@${PI_IP}:~/printer_data/config/variables.cfg
+scp ~/KlipperXL/config/variables.cfg pi@${PI_IP}:~/printer_data/config/variables.cfg
 
 # Create macros directory and copy macros
 ssh pi@${PI_IP} "mkdir -p ~/printer_data/config/macros"
-scp config_files/macros/print_macros.cfg pi@${PI_IP}:~/printer_data/config/macros/print_macros.cfg
+scp ~/KlipperXL/config/macros/print_macros.cfg pi@${PI_IP}:~/printer_data/config/macros/print_macros.cfg
 ```
 
 ### 7.2 Update Serial Port in printer.cfg
@@ -300,7 +300,7 @@ We provide an automated script that fixes this. SSH to your Pi and run:
 
 ```bash
 # Copy the script to your Pi first (from your build computer)
-scp post_install/fix_klipper_dirty.sh pi@${PI_IP}:/tmp/
+scp ~/KlipperXL/scripts/fix_klipper_dirty.sh pi@${PI_IP}:/tmp/
 
 # SSH to Pi and run it
 ssh pi@${PI_IP}
@@ -367,7 +367,7 @@ If you want to do it by hand, here are the steps:
 ```bash
 # 1. Edit the exclude file
 nano /home/pi/klipper/.git/info/exclude
-# Add the entries from post_install/git_exclude_entries.txt
+# Add the entries from scripts/git_exclude_entries.txt
 
 # 2. Mark Makefiles as unchanged
 cd /home/pi/klipper
@@ -400,7 +400,7 @@ ln -s ~/klipper-led_effect/src/led_effect.py ~/klipper/klippy/extras/led_effect.
 **Deploy the LED effects config:**
 ```bash
 # From your build computer
-scp config_files/led_effects.cfg pi@${PI_IP}:~/printer_data/config/led_effects.cfg
+scp ~/KlipperXL/config/led_effects.cfg pi@${PI_IP}:~/printer_data/config/led_effects.cfg
 ```
 
 The LED configuration is already included in the printer.cfg (`[neopixel side_leds]` section).
@@ -425,7 +425,7 @@ make install
 **Deploy the webcam config:**
 ```bash
 # From your build computer
-scp config_files/crowsnest.conf pi@${PI_IP}:~/printer_data/config/crowsnest.conf
+scp ~/KlipperXL/config/crowsnest.conf pi@${PI_IP}:~/printer_data/config/crowsnest.conf
 ```
 
 **Start the service:**
@@ -551,7 +551,7 @@ If you prefer importing a complete profile bundle instead of modifying
 the generic tool changer profile:
 
 1. Go to **File > Import > Import Config Bundle**
-2. Select `KlipperXL_Install_Package/orcaslicer/KlipperXL_Profile.ini`
+2. Select `KlipperXL/orcaslicer/KlipperXL_Profile.ini`
 3. Profiles appear in your printer/print/filament dropdowns
 
 ---
