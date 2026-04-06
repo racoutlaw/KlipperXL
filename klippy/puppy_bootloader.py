@@ -6205,6 +6205,12 @@ class PuppyBootloader:
             self._cal_state = 'remove_pins'
             self._cal_verify_count = 0
             # Start next dock
+            # Move carriage to center so user can access next dock
+            self.gcode.run_script_from_command("G1 X180 Y350 F5000")
+            self._wait_for_moves()
+            self.gcode.run_script_from_command("M84 X Y")
+            self.gcode.respond_info(
+                "Carriage moved to center - steppers disabled")
             dwarf = dock + 1
             default_x = self.DOCK_FIRST_X + dock * self.DOCK_OFFSET_X
             default_y = self.DOCK_Y
