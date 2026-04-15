@@ -1,4 +1,6 @@
-# Advanced: USB Drive Firmware Flashing
+# USB Drive Firmware Flashing — Technical Reference
+
+> **Note:** As of 2026-04-14, USB BBF flashing is the **default install method** covered in the main [Installation Guide](INSTALLATION_GUIDE.md) (Section 6). This document remains as a technical reference and for bootloader recovery / stock restore scenarios. For a fresh KlipperXL install, follow the main guide.
 
 Flash KlipperXL firmware via USB drive instead of DFU — no BOOT0 jumper needed for updates.
 

@@ -4,6 +4,20 @@ All notable changes to KlipperXL are documented here.
 
 ---
 
+## 2026-04-14
+
+### USB BBF is now the default flash method
+- Restructured `INSTALLATION_GUIDE.md` to make USB drive flashing the primary path (Section 6)
+- DFU flashing moved to Section 12 as an advanced / recovery-only method
+- Rationale: USB BBF requires no opening the printer, no BOOT0 jumper, preserves the Prusa bootloader, and future updates are drag-and-drop to a USB stick
+- Section 3.4 now instructs users to set bootloader offset to **128KiB with STM32 bootloader (0x08020200)** by default
+- New Section 3.6: packaging the firmware as `.bbf` with `pack_fw.py`
+- Section 1 (Prerequisites) now lists the FAT32 USB drive and broken-appendix requirement up front
+- Troubleshooting updated with USB BBF-first error guidance
+- Thanks to @Ro3Deee for raising the issue
+
+---
+
 ## 2026-04-05
 
 ### Build & Install Fixes

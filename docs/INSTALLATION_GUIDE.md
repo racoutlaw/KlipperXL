@@ -14,12 +14,13 @@ Complete step-by-step guide to install KlipperXL on a Prusa XL with XLBuddy boar
 3. [Clone KlipperXL and Build Firmware](#3-clone-klipperxl-and-build-firmware)
 4. [Deploy Python Modules](#4-deploy-python-modules)
 5. [Deploy Configuration Files](#5-deploy-configuration-files)
-6. [Flash XLBuddy MCU](#6-flash-xlbuddy-mcu)
+6. [Flash XLBuddy via USB Drive](#6-flash-xlbuddy-via-usb-drive)
 7. [Fix Klipper Update Manager (Dirty State)](#7-fix-klipper-update-manager-dirty-state)
 8. [Optional: LED Strips and Webcam](#8-optional-led-strips-and-webcam)
 9. [Configure OrcaSlicer](#9-configure-orcaslicer)
 10. [First Boot and Calibration](#10-first-boot-and-calibration)
 11. [Troubleshooting](#11-troubleshooting)
+12. [Advanced: DFU Flash and Recovery](#12-advanced-dfu-flash-and-recovery)
 
 ---
 
@@ -31,6 +32,10 @@ Complete step-by-step guide to install KlipperXL on a Prusa XL with XLBuddy boar
 - MicroSD card (16GB+)
 - USB cable (USB-A to USB-C for XLBuddy connection)
 - Ethernet or WiFi connection for Pi
+- **FAT32 USB drive** (for flashing firmware to the XLBuddy)
+- **Broken appendix / safety seal** on the XLBuddy board — required to bypass Prusa's firmware signature verification
+
+> ⚠️ **About the broken appendix:** the Prusa bootloader checks firmware signatures. Unsigned Klipper firmware will be rejected unless the safety seal (appendix) on the XLBuddy is broken. This is the same requirement for any custom firmware on the XL. If yours is intact, the bootloader will refuse to flash KlipperXL and you'll need to either break the appendix or use the DFU recovery method in [Section 12](#12-advanced-dfu-flash-and-recovery).
 
 ### Software Required
 Everything is built directly on the Raspberry Pi — no separate build computer needed.
@@ -164,12 +169,14 @@ make menuconfig
 Set these options:
 - **Micro-controller Architecture:** STMicroelectronics STM32
 - **Processor model:** STM32F407
-- **Bootloader offset:** No bootloader
+- **Bootloader offset:** **128KiB with STM32 bootloader (0x08020200)**
 - **Clock Reference:** 12 MHz crystal
 - **Communication interface:** USB (on PA11/PA12)
 - **USB ids:** 0x1d50 / 0x614e
 
 Save and exit.
+
+> 🔑 **Why this offset?** KlipperXL is installed via USB drive using Prusa's own bootloader (not DFU). The bootloader lives at `0x08000000` and Klipper goes after it at `0x08020200`. This keeps the Prusa bootloader intact, so future firmware updates are just drag-and-drop to a USB stick — no BOOT0 jumper, no opening the printer. See [Section 12](#12-advanced-dfu-flash-and-recovery) if you need the "No bootloader" DFU path instead.
 
 ### 3.5 Build the Firmware
 
@@ -181,6 +188,24 @@ make -j4
 
 You should see `Compiling out/src/modbus_stm32f4.o` in the output.
 A few warnings about unused functions are normal. This creates `~/klipper/out/klipper.bin`
+
+### 3.6 Package the Firmware as .bbf
+
+The Prusa bootloader flashes `.bbf` files from a USB drive. Package `klipper.bin` using the included `pack_fw.py` tool:
+
+```bash
+# Install the one Python dependency (only needed once)
+~/klippy-env/bin/pip install ecdsa
+
+# Package the firmware
+~/klippy-env/bin/python ~/KlipperXL/scripts/pack_fw.py ~/klipper/out/klipper.bin \
+  --no-sign --version 1.0.0+1 --printer-type 3 \
+  --printer-version 1 --printer-subversion 0 --bbf-version 2
+```
+
+This creates `~/klipper/out/klipper.bbf` — the file you'll copy to your USB drive in [Section 6](#6-flash-xlbuddy-via-usb-drive).
+
+The `--no-sign` flag produces an unsigned `.bbf` — the broken appendix on the XLBuddy allows the bootloader to accept it.
 
 ---
 
@@ -248,73 +273,87 @@ Save and exit (`Ctrl+O`, Enter, `Ctrl+X`).
 
 ---
 
-## 6. Flash XLBuddy MCU
+## 6. Flash XLBuddy via USB Drive
 
-### 6.1 Enter DFU Mode
+This is the recommended flash method — no soldering, no jumper, no opening the printer. The Prusa bootloader reads firmware from a USB drive and flashes it while preserving itself.
 
-**IMPORTANT: This requires physical access to the XLBuddy board!**
+**Requirements:**
+- Broken appendix / safety seal on the XLBuddy (see [Section 1](#1-prerequisites))
+- FAT32-formatted USB drive
 
-1. **Power OFF** the printer completely
-2. Locate the **BOOT0 jumper** on the XLBuddy board
-3. **Install the jumper** to enable DFU mode
-4. Connect the XLBuddy to the Pi via USB cable
-5. **Power ON** the printer
-6. The XLBuddy is now in DFU mode (no display activity is normal)
+If you're missing either, use the DFU recovery method in [Section 12](#12-advanced-dfu-flash-and-recovery) instead.
 
-### 6.2 Flash via DFU
+### 6.1 Copy klipper.bbf to the USB Drive
 
-On the Pi:
+On your Pi, `klipper.bbf` was built in Section 3.6 at `~/klipper/out/klipper.bbf`. Transfer it to a FAT32 USB drive — use whichever method you prefer:
 
+**From your main computer** (with the USB drive plugged into it):
 ```bash
-# Install dfu-util if not present
-sudo apt install dfu-util -y
-
-# Verify DFU device is detected
-sudo dfu-util -l
+scp pi@<PI_IP>:/home/pi/klipper/out/klipper.bbf /path/to/usb_drive/
 ```
 
-You should see a device with `Internal Flash` listed.
-
-Flash the firmware:
+**Or directly on the Pi** (with the USB drive plugged into the Pi):
 ```bash
-sudo dfu-util -a 0 -s 0x08000000:leave -D ~/klipper/out/klipper.bin
+cp ~/klipper/out/klipper.bbf /media/pi/<USB_NAME>/
 ```
 
-### 6.3 Exit DFU Mode
+### 6.2 Flash the Printer
 
-1. **Power OFF** the printer
-2. **Remove the BOOT0 jumper**
-3. **Power ON** the printer
-4. The XLBuddy should now appear as a USB serial device
+1. Safely eject the USB drive from your computer / Pi
+2. Plug it into the **printer's front USB port**
+3. **Power cycle** the printer (off, wait a few seconds, on)
+4. The Prusa bootloader screen appears and detects `klipper.bbf`
+5. If prompted about signature verification, click **Ignore**
+6. Let the bootloader flash the firmware
+7. The progress bar will **stop at ~50%** — **this is normal**. Klipper has taken over and doesn't drive the printer display
+8. Power OFF the printer
+9. Remove the USB drive
+10. Power ON the printer
 
-### 6.4 Update Serial Port in printer.cfg
+### 6.3 Update Serial Port in printer.cfg
 
-Get your device ID:
+On the Pi, get the XLBuddy's device ID:
+
 ```bash
 ls /dev/serial/by-id/
 ```
 
-You should see something like: `usb-Klipper_stm32f407xx_XXXXXXXXX-if00`
+You should see: `usb-Klipper_stm32f407xx_XXXXXXXXX-if00`
 
 Edit printer.cfg:
 ```bash
 nano ~/printer_data/config/printer.cfg
 ```
 
-Find the `[mcu]` section and update the serial port:
+Find the `[mcu]` section and replace the serial line with your actual device:
 
 ```ini
 [mcu]
 serial: /dev/serial/by-id/usb-Klipper_stm32f407xx_XXXXXXXXX-if00
 ```
 
-Replace `XXXXXXXXX` with your actual device ID.
-
-### 6.5 Restart Klipper
+### 6.4 Restart Klipper
 
 ```bash
 sudo systemctl restart klipper
 ```
+
+Klipper should now connect to the XLBuddy. Check the web UI or `sudo systemctl status klipper` to confirm.
+
+### 6.5 Future Firmware Updates
+
+Once set up, updating Klipper is simple — no opening the printer, no jumper:
+
+```bash
+cd ~/klipper
+make clean
+make -j4
+~/klippy-env/bin/python ~/KlipperXL/scripts/pack_fw.py ~/klipper/out/klipper.bin \
+  --no-sign --version 1.0.0+1 --printer-type 3 \
+  --printer-version 1 --printer-subversion 0 --bbf-version 2
+```
+
+Copy `klipper.bbf` to USB → plug into printer → power cycle → restart Klipper. Done.
 
 ---
 
@@ -689,7 +728,25 @@ Verify temperatures in the web UI match expectations.
 
 ### "MCU 'mcu' shutdown: Timer too close"
 - The MCU firmware wasn't flashed correctly
-- Re-flash via DFU mode
+- Rebuild and re-flash via USB BBF (see [Section 6.5](#65-future-firmware-updates))
+
+### Bootloader shows "Firmware corrupted" after USB flash
+- Klipper was built at the wrong offset (`0x08020000` instead of `0x08020200`)
+- Re-run `make menuconfig` and set **Bootloader offset: 128KiB with STM32 bootloader**
+- Rebuild, repack with `pack_fw.py`, and flash again
+
+### Bootloader stuck at progress bar
+- If it stops at ~50%, this is **normal** — Klipper has taken over but doesn't drive the display
+- Restart Klipper on the Pi: `sudo systemctl restart klipper`
+
+### BBF file rejected / signature verification error
+- Make sure your XLBuddy has a **broken appendix** (safety seal) to bypass signature checking
+- Click **Ignore** when prompted by the bootloader
+- Confirm the `.bbf` was built with the `--no-sign` flag (default in our `pack_fw.py` command)
+
+### Bootloader missing / can't flash via USB
+- The Prusa bootloader has been overwritten (usually by a previous DFU flash at `0x08000000`)
+- Follow [Section 12.5](#125-restoring-the-prusa-bootloader) to restore it via DFU, then return to USB BBF flashing
 
 ### "Unable to connect to MCU"
 - Check USB cable connection
@@ -807,4 +864,82 @@ Verify temperatures in the web UI match expectations.
 
 ---
 
-*Guide updated 2026-04-05 for KlipperXL project*
+## 12. Advanced: DFU Flash and Recovery
+
+Use this method only when:
+- Your XLBuddy's **appendix is intact** (can't use USB BBF)
+- The **Prusa bootloader is missing or corrupted** and needs to be restored
+- You prefer the DFU flow for some other reason
+
+> ⚠️ **Warning:** DFU flashing at offset `0x08000000` with Klipper built at "No bootloader" will **overwrite the Prusa bootloader**. You will lose USB BBF flashing ability and must always use DFU for future updates until you restore the bootloader. For most users, the USB BBF method in [Section 6](#6-flash-xlbuddy-via-usb-drive) is safer and easier.
+
+### 12.1 Build with "No Bootloader" Offset
+
+If you're using DFU, rebuild the firmware with the "No bootloader" offset:
+
+```bash
+cd ~/klipper
+make menuconfig
+```
+
+Change **Bootloader offset** to **No bootloader**, save and exit. Then:
+
+```bash
+make clean
+make -j4
+```
+
+### 12.2 Enter DFU Mode
+
+**IMPORTANT: This requires physical access to the XLBuddy board.**
+
+1. **Power OFF** the printer completely
+2. Locate the **BOOT0 jumper** on the XLBuddy board
+3. **Install the jumper** to enable DFU mode
+4. Connect the XLBuddy to the Pi via USB cable
+5. **Power ON** the printer
+6. The XLBuddy is now in DFU mode (no display activity is normal)
+
+### 12.3 Flash via DFU
+
+On the Pi:
+
+```bash
+# Install dfu-util if not present
+sudo apt install dfu-util -y
+
+# Verify DFU device is detected
+sudo dfu-util -l
+```
+
+You should see a device with `Internal Flash` listed.
+
+Flash the firmware:
+```bash
+sudo dfu-util -a 0 -s 0x08000000:leave -D ~/klipper/out/klipper.bin
+```
+
+### 12.4 Exit DFU Mode
+
+1. **Power OFF** the printer
+2. **Remove the BOOT0 jumper**
+3. **Power ON** the printer
+4. The XLBuddy should now appear as a USB serial device
+
+Then update the serial port in `printer.cfg` and restart Klipper as described in [Sections 6.3 and 6.4](#63-update-serial-port-in-printercfg).
+
+### 12.5 Restoring the Prusa Bootloader
+
+If DFU wiped your bootloader and you want to go back to USB BBF flashing:
+
+1. With BOOT0 jumper still installed, flash the bootloader binary:
+   ```bash
+   sudo dfu-util -a 0 -s 0x08000000 -D ~/KlipperXL/firmware/recovery/bootloader-xl-2.5.0.bin
+   ```
+2. Remove the BOOT0 jumper and power cycle
+3. Flash stock Prusa firmware first (via USB BBF using the Prusa `.bbf` from [Prusa downloads](https://www.prusa3d.com/page/firmware-and-software_541542/)) to update the Dwarfs
+4. Rebuild Klipper with the **128KiB with STM32 bootloader (0x08020200)** offset and flash via USB BBF going forward
+
+---
+
+*Guide updated 2026-04-14 for KlipperXL project — USB BBF is now the default flash method*
