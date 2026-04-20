@@ -82,6 +82,7 @@ fi
 # Step 1: Copy MODBUS MCU module
 echo "[1/6] Copying MODBUS module to Klipper source..."
 cp "$MODULE_DIR/src/modbus_stm32f4.c" ~/klipper/src/
+cp "$MODULE_DIR/src/neopixel_spi.c" ~/klipper/src/
 echo "  Done."
 
 # Step 2: Copy Python extras
@@ -93,6 +94,7 @@ cp "$MODULE_DIR/klippy/loadcell_probe.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/pca9557.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/dwarf_accelerometer.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/tool_offsets.py" ~/klipper/klippy/extras/
+cp "$MODULE_DIR/klippy/strobe_test.py" ~/klipper/klippy/extras/
 ~/klippy-env/bin/pip install numpy -q 2>/dev/null
 echo "  Done (numpy installed for input shaper)."
 
@@ -109,6 +111,15 @@ echo ""
 echo "  NOTE: Edit ~/printer_data/config/printer.cfg to:"
 echo "    - Change [include mainsail.cfg] to [include fluidd.cfg] if using Fluidd"
 echo "    - Comment out [include led_effects.cfg] if not using side LED strips"
+
+# Step 4b: Patch src/Makefile for neopixel_spi (strobe feature)
+KLIPPER_SRC_MK=~/klipper/src/Makefile
+if grep -q "neopixel_spi" "$KLIPPER_SRC_MK"; then
+    echo "  neopixel_spi.c already in src/Makefile - skipping"
+else
+    sed -i '/^src-$(CONFIG_WANT_NEOPIXEL) += neopixel.c$/a src-$(CONFIG_WANT_NEOPIXEL) += neopixel_spi.c' "$KLIPPER_SRC_MK"
+    echo "  src/Makefile: added neopixel_spi.c"
+fi
 
 # Step 4: Patch STM32 Makefile
 echo ""

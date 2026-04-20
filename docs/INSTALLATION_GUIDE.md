@@ -525,7 +525,7 @@ Set to: **Klipper**
 Delete everything in the start G-code box and replace with this single line:
 
 ```gcode
-START_PRINT EXTRUDER_TEMP=[nozzle_temperature_initial_layer] BED_TEMP=[bed_temperature_initial_layer_single] TOTAL_LAYER_COUNT={total_layer_count} X0={first_layer_print_min[0]} Y0={first_layer_print_min[1]} X1={first_layer_print_max[0]} Y1={first_layer_print_max[1]}
+START_PRINT EXTRUDER_TEMP=[nozzle_temperature_initial_layer] BED_TEMP=[bed_temperature_initial_layer_single] TOOL=[initial_extruder] TOTAL_LAYER_COUNT={total_layer_count} X0={first_layer_print_min[0]} Y0={first_layer_print_min[1]} X1={first_layer_print_max[0]} Y1={first_layer_print_max[1]}
 ```
 
 **IMPORTANT:** Replace the ENTIRE start gcode. The generic profile has per-tool
@@ -580,10 +580,15 @@ _ON_LAYER_CHANGE LAYER={layer_num + 1}
 ;[layer_z]
 ```
 
-#### Between Objects G-code
+#### Between Objects G-code (in OrcaSlicer, this field is labeled "Printing by object G-code" — only emitted when Print Sequence = By Object)
 ```gcode
 ;BETWEEN_OBJECTS
 G92 E0
+```
+
+#### Time Lapse G-code
+```gcode
+TIMELAPSE_TAKE_FRAME
 ```
 
 #### Print Settings (Process Tab)

@@ -35,6 +35,7 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 - **Input Shaper** - Resonance compensation via Dwarf accelerometers (per-tool measurement)
 - **Z Tilt Alignment** - Prusa-matched mechanical bed leveling
 - **Per-Tool Z Offset** - Fine-tune first layer height per tool using Mainsail's built-in Z offset controls, saved to printer.cfg via `[tool_offsets]`
+- **LED Stroboscope** - Belt tension / VFA visualization via the side LED strip white channel. TIM13-driven autonomous strobe at 60-130 Hz with configurable duty cycle. Button-friendly macros: `STROBE_BELT` (start) / `STROBE_OFF` (stop)
 
 ### Heater Management
 - **Multi-Tool Heater Preservation** - Parked tools maintain temperature via periodic MODBUS refresh
