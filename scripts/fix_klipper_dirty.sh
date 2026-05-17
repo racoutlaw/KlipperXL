@@ -54,6 +54,10 @@ src/modbus_stm32f4.c
 src/stm32/modbus_stm32f4.c
 .config_xlbuddy
 .config_xlbuddy.old
+
+# Strobe project (LED belt-tension visualizer)
+klippy/extras/strobe_test.py
+src/neopixel_spi.c
 EOF
     echo "  Done."
 fi
@@ -65,6 +69,7 @@ cd "$KLIPPER_DIR"
 
 # These are tracked files we modified to add modbus_stm32f4.c to the build
 git update-index --assume-unchanged src/stm32/Makefile 2>/dev/null && echo "  src/stm32/Makefile marked" || echo "  src/stm32/Makefile not found (OK)"
+git update-index --assume-unchanged src/Makefile 2>/dev/null && echo "  src/Makefile marked (strobe)" || echo "  src/Makefile not found (OK)"
 
 # Step 3: Clear Moonraker's cached dirty state
 echo ""
