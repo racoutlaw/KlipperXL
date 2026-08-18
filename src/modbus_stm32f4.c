@@ -1388,6 +1388,78 @@ static struct {
 // Safety: abort if no samples for this many microseconds
 #define LOADCELL_STALE_TIMEOUT_US  50000
 
+
+/****************************************************************
+ * Loadcell sample streaming (automatic Pressure Advance)
+ *
+ * Host-side MODBUS polling of this FIFO cannot survive extrusion: the Dwarf
+ * intermittently fails to answer and each miss costs a flat 5s Klipper
+ * MCU-query timeout (measured: ~1 per 10-15s while extruding). This task
+ * already runs in C every 3ms and never waits on the host, so streaming from
+ * here is immune -- the same reason the Z probe works reliably.
+ *
+ * Streams RAW counts + the Dwarf timestamp; taring is done host-side.
+ ****************************************************************/
+
+// 6 samples * 8 bytes = 48 byte payload, inside Klipper's 64-byte message limit.
+#define LOADCELL_STREAM_BATCH 6
+
+static struct {
+    uint8_t active;                            // streaming enabled
+    uint8_t count;                             // samples buffered
+    uint8_t buf[LOADCELL_STREAM_BATCH * 8];    // (ts u32 LE, raw i32 LE) pairs
+    uint32_t sent;                             // samples pushed to the host
+    uint32_t batches;                          // messages sent
+} loadcell_stream;
+
+static void loadcell_stream_flush(void)
+{
+    if (!loadcell_stream.count)
+        return;
+    sendf("loadcell_stream_data data=%*s",
+          loadcell_stream.count * 8, loadcell_stream.buf);
+    loadcell_stream.sent += loadcell_stream.count;
+    loadcell_stream.batches++;
+    loadcell_stream.count = 0;
+}
+
+static void loadcell_stream_add(uint32_t dwarf_ts, int32_t raw)
+{
+    if (loadcell_stream.count >= LOADCELL_STREAM_BATCH)
+        loadcell_stream_flush();
+    uint8_t *p = &loadcell_stream.buf[loadcell_stream.count * 8];
+    p[0] = dwarf_ts & 0xFF;
+    p[1] = (dwarf_ts >> 8) & 0xFF;
+    p[2] = (dwarf_ts >> 16) & 0xFF;
+    p[3] = (dwarf_ts >> 24) & 0xFF;
+    uint32_t r = (uint32_t)raw;
+    p[4] = r & 0xFF;
+    p[5] = (r >> 8) & 0xFF;
+    p[6] = (r >> 16) & 0xFF;
+    p[7] = (r >> 24) & 0xFF;
+    loadcell_stream.count++;
+}
+
+void command_loadcell_stream_start(uint32_t *args)
+{
+    loadcell_probe.dwarf_addr = args[0];
+    loadcell_stream.count = 0;
+    loadcell_stream.sent = 0;
+    loadcell_stream.batches = 0;
+    loadcell_stream.active = 1;
+    sendf("loadcell_stream_start_ack addr=%c", loadcell_probe.dwarf_addr);
+}
+DECL_COMMAND(command_loadcell_stream_start, "loadcell_stream_start addr=%c");
+
+void command_loadcell_stream_stop(uint32_t *args)
+{
+    loadcell_stream_flush();
+    loadcell_stream.active = 0;
+    sendf("loadcell_stream_result sent=%u batches=%u",
+          loadcell_stream.sent, loadcell_stream.batches);
+}
+DECL_COMMAND(command_loadcell_stream_stop, "loadcell_stream_stop");
+
 // Helper: poll FIFO and process loadcell samples
 static int loadcell_poll_fifo(void)
 {
@@ -1445,6 +1517,16 @@ static int loadcell_poll_fifo(void)
                         | (fifo_data[pos + 7] << 16)
                         | (fifo_data[pos + 8] << 24));
 
+            // PA streaming: keep the RAW count and the Dwarf's own timestamp
+            // (bytes pos+1..pos+4, which this function otherwise discards).
+            if (loadcell_stream.active) {
+                uint32_t dwarf_ts = (uint32_t)(fifo_data[pos + 1]
+                                  | (fifo_data[pos + 2] << 8)
+                                  | (fifo_data[pos + 3] << 16)
+                                  | (fifo_data[pos + 4] << 24));
+                loadcell_stream_add(dwarf_ts, raw);
+            }
+
             // Apply tare offset
             int32_t load = raw - loadcell_probe.tare_offset;
             loadcell_probe.last_load = load;
@@ -1464,8 +1546,10 @@ static int loadcell_poll_fifo(void)
                 continue;
             }
 
-            // Check threshold based on mode
-            if (!loadcell_probe.triggered) {
+            // Check threshold based on mode.
+            // `monitoring` guard added with stream mode: the task now also runs
+            // when only streaming, and must NOT trip trsync/shutdown then.
+            if (loadcell_probe.monitoring && !loadcell_probe.triggered) {
                 int trigger = 0;
                 if (loadcell_probe.xy_mode) {
                     // XY mode: trigger on absolute value exceeding threshold
@@ -1725,11 +1809,12 @@ DECL_COMMAND(command_loadcell_tare, "loadcell_tare addr=%c samples=%c");
 // Loadcell probe polling task - runs continuously when monitoring is active
 void loadcell_probe_task(void)
 {
-    if (!loadcell_probe.monitoring)
+    if (!loadcell_probe.monitoring && !loadcell_stream.active)
         return;
 
-    // Already triggered - stop polling
-    if (loadcell_probe.triggered)
+    // Already triggered - stop polling. Streaming ignores this: a probe trigger
+    // has nothing to do with a PA recording.
+    if (loadcell_probe.triggered && !loadcell_stream.active)
         return;
 
     // Rate limit polling

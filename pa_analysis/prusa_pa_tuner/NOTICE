@@ -1,0 +1,86 @@
+================================================================================
+ THIRD-PARTY CODE - NOT WRITTEN BY THE KlipperXL AUTHOR
+================================================================================
+
+Everything in this directory (prusa_pa_tuner/) is the work of:
+
+    Stefan Hermann (CNC Kitchen)
+    Project : PrusaPATuner  --  package "prusa-pa-tuner" version 0.1.0
+    Upstream: https://github.com/CNCKitchen/PrusaPATuner
+    Licence : GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
+
+The full licence text is in the LICENSE file beside this NOTICE.
+
+--------------------------------------------------------------------------------
+ WHAT IT DOES AND WHY IT IS HERE
+--------------------------------------------------------------------------------
+
+These modules contain the Pressure Advance analysis mathematics: they take a
+loadcell pressure trace recorded during a K-value sweep and determine the
+optimal K. That analysis is the hard part of automatic PA tuning, and Stefan
+worked it out and published it. KlipperXL did not reinvent it and does not
+claim it.
+
+KlipperXL supplies the parts around it: capturing the trace from the Dwarf
+loadcell over MODBUS, running the sweep, and storing a K per tool.
+
+--------------------------------------------------------------------------------
+ WHY IT IS VENDORED INSTEAD OF DOWNLOADED AT INSTALL TIME
+--------------------------------------------------------------------------------
+
+A copy is included in this repository, rather than fetched from GitHub during
+installation, so that KlipperXL remains buildable and installable even if the
+upstream repository is renamed, made private, or taken offline. A firmware
+project that cannot be rebuilt from its own sources is not reproducible.
+
+The AGPL expressly permits redistribution on these terms.
+
+--------------------------------------------------------------------------------
+ MODIFICATIONS
+--------------------------------------------------------------------------------
+
+NONE. These files are byte-for-byte as published upstream.
+
+If that ever changes, the modification must be described here, with the date
+and what was changed, and the modified files must carry prominent notices
+stating that they were changed and when -- AGPL-3.0 section 5(a).
+
+--------------------------------------------------------------------------------
+ HOW IT IS USED, AND WHAT THAT MEANS FOR LICENCES
+--------------------------------------------------------------------------------
+
+KlipperXL as a whole is licensed GPL-3.0 (see the LICENSE at the repository
+root). This directory is AGPL-3.0-or-later and stays that way: copying it out
+of here does not relicense it, and the AGPL's terms continue to govern it.
+
+The two licences are compatible in this direction. GPL-3.0 section 13 expressly
+permits linking a GPL-3.0 work with an AGPL-3.0 work, and AGPL-3.0 section 13
+grants the mirror-image permission.
+
+In practice KlipperXL keeps them further apart than the licences require: this
+code is never imported into the Klipper process. It runs as a separate Python
+subprocess in its own virtual environment (see ../pa_analyze.py), for the
+independent technical reason that scipy must never be able to disturb the
+environment that drives the printer.
+
+Note on AGPL section 13, the network clause: it obliges anyone who *modifies*
+this code and lets users interact with it *remotely over a network* to offer
+those users the modified source. Running KlipperXL to tune your own printer
+does not trigger it. Neither does using Mainsail or Fluidd on your own network.
+It would apply to someone offering a modified version of this analyser as a
+hosted service.
+
+--------------------------------------------------------------------------------
+ IF YOU FIND THIS USEFUL
+--------------------------------------------------------------------------------
+
+Support the upstream project and its author:
+
+    https://github.com/CNCKitchen/PrusaPATuner
+    https://www.cnckitchen.com/
+    https://www.youtube.com/@CNCKitchen
+
+--------------------------------------------------------------------------------
+
+This notice is a good-faith effort at correct attribution and licence
+compliance. It is not legal advice.

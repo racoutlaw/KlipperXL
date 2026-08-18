@@ -1,0 +1,10 @@
+# Dependencies for the KlipperXL Pressure Advance analyser.
+#
+# These install into ~/pa_analysis_env, NOT into klippy-env. Keeping scipy out of
+# the environment that drives the printer is deliberate -- see README.md.
+#
+# Version floors come from upstream PrusaPATuner's pyproject.toml. Verified
+# working on a Raspberry Pi with Python 3.13.5 / numpy 2.5.2 / scipy 1.18.0.
+
+numpy>=1.26
+scipy>=1.12

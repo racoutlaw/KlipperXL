@@ -32,6 +32,7 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 - **Adjustable Probe Thresholds** - Change loadcell sensitivity for Z, mesh, and XY calibration from Mainsail
 
 ### Motion & Calibration
+- **Automatic Per-Tool Pressure Advance** *(new — requires a firmware re-flash)* - Measures PA for **each tool separately** using that Dwarf's own loadcell as a back-pressure sensor, then applies the right value on every tool change. One button, ~6 minutes, no test prints and no eyeballing corners. Tools are not interchangeable in practice — on a 5-tool XL, the same spool measured 0.0367 / 0.0552 / 0.0647 across T0/T1/T2, a 77% spread — so a single shared PA value is wrong for most of your tools. Analysis by [CNC Kitchen](https://github.com/CNCKitchen/PrusaPATuner). See the [Pressure Advance Guide](docs/PRESSURE_ADVANCE.md)
 - **Input Shaper** - Resonance compensation via Dwarf accelerometers (per-tool measurement)
 - **Z Tilt Alignment** - Prusa-matched mechanical bed leveling
 - **Per-Tool Z Offset** - Fine-tune first layer height per tool using Mainsail's built-in Z offset controls, saved to printer.cfg via `[tool_offsets]`
@@ -58,6 +59,20 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 | **Toolheads** | Dwarf boards (stock Prusa firmware, unmodified) |
 | **Host** | Raspberry Pi 4 or 5 |
 | **Calibration** | Prusa calibration pin (for tool offsets) |
+| **Flashing** | FAT32 USB drive |
+| **Appendix** | **Broken appendix / safety seal on the XLBuddy — this is permanent** |
+
+> ⚠️ **Read this before you start.** The Prusa bootloader verifies firmware
+> signatures and will reject unsigned Klipper firmware unless the **appendix**
+> (safety seal) on the XLBuddy is broken. Breaking it is a **physical,
+> irreversible modification to your mainboard** — it cannot be undone, and it is
+> the same requirement as for any custom firmware on the XL.
+>
+> Everything else here is reversible: you can flash stock Prusa firmware back at
+> any time and the printer returns to normal. The appendix is the one step that
+> does not come back. Decide about it before you begin, not halfway through.
+>
+> Details in the [Installation Guide](docs/INSTALLATION_GUIDE.md#1-prerequisites).
 
 ## How It Works
 
@@ -85,6 +100,7 @@ KlipperXL/
   firmware/                  Build config & recovery files
   orcaslicer/                Slicer profile and configuration guide
   scripts/                   Installation & fix scripts
+  pa_analysis/               Pressure Advance analyser (separate venv, see its README)
 ```
 
 ## Key Commands
@@ -112,6 +128,12 @@ KlipperXL/
 | `GET_TOOL_Z_OFFSETS` | Display per-tool Z offsets |
 | `SET_TOOL_Z_OFFSET TOOL= Z=` | Set Z offset for a tool (in memory) |
 | `SAVE_TOOL_Z_OFFSET TOOL= Z=` | Save Z offset for a tool to config |
+| `PA_TUNE_T0` - `PA_TUNE_T4` | Auto-tune Pressure Advance for one tool, end to end |
+| `GET_TOOL_PA` | Display per-tool Pressure Advance values |
+| `SET_TOOL_PA TOOL= K=` | Set a tool's Pressure Advance (in memory) |
+| `SAVE_TOOL_PA TOOL= K=` | Save a tool's Pressure Advance to config |
+| `CALIBRATE_PA TOOL= TEMP=` | Run a PA sweep only (no analysis, no save) |
+| `ANALYZE_PA TOOL= SAVE=1` | Analyse the last PA recording |
 
 ## Per-Tool Z Offset
 
@@ -151,6 +173,64 @@ These offsets are automatically combined with the calibrated tool offsets during
 - Safety bounds: -0.3mm to +0.5mm per tool
 - These offsets persist across restarts (stored in `printer.cfg`)
 
+## Per-Tool Pressure Advance
+
+Every tool stores and uses **its own** Pressure Advance value. This is not one PA
+setting shared by the toolhead group — all five are measured independently and
+the right one is applied on each tool change.
+
+> ⚠️ **Already running KlipperXL? This needs a firmware rebuild and re-flash.**
+> The measurement depends on MCU-side loadcell streaming, which lives in
+> `src/modbus_stm32f4.c` — copying the Python modules alone will capture nothing.
+> Step-by-step upgrade instructions are in the
+> [CHANGELOG](CHANGELOG.md#upgrading-to-2026-08-16-from-an-earlier-version).
+
+The tools look identical on paper. They do not behave identically. Measured on
+one machine, **same spool, same nozzle size, same temperature**:
+
+| Tool | Measured K (PLA @ 215 °C) |
+|------|---------------------------|
+| T0 | 0.0367 |
+| T1 | 0.0552 |
+| T2 | 0.0647 |
+
+A 77% spread. Extruder gear wear, PTFE liner friction and heatbreak tolerance all
+land on this one knob; on a single-tool printer they disappear into one
+calibration, but on a five-tool machine they are five different printers sharing
+a frame.
+
+### Tuning Workflow
+
+1. Load filament into the tool
+2. Click **`PA_TUNE_T1`** (or set `TEMP` / `FILAMENT` in its dropdown first)
+3. Wait ~6 minutes. It homes, heats, sweeps, analyses and applies the result
+4. Print a test if you want — the value is already live
+5. Run **`SAVE_CONFIG`** to keep it
+6. Repeat for each tool
+
+The values land in `[tool_pa]` and are re-applied automatically from then on:
+
+```ini
+[tool_pa]
+t0_pa: 0.0367
+t1_pa: 0.0552
+t2_pa: 0.0647
+```
+
+### Important Notes
+
+- **Do NOT set pressure advance in your slicer** — leave it out. Klipper applies
+  the per-tool value on every tool change and a slicer `SET_PRESSURE_ADVANCE`
+  will override it
+- PA depends on the **filament**, not only the tool. Re-run it when you change
+  material; the `FILAMENT` label records what a value was measured on
+- Nothing is saved until you run `SAVE_CONFIG` — deliberate, so you can print
+  first and discard a bad result by simply not saving
+- A never-tuned tool is left alone, not forced to zero
+
+Full details, including how to get a more precise number: the
+[Pressure Advance Guide](docs/PRESSURE_ADVANCE.md).
+
 ## OrcaSlicer Setup
 
 Use the built-in **Generic Tool Changer** profile as your base. You only need to change 4 settings:
@@ -168,7 +248,7 @@ These values have been tuned on a 5-tool Prusa XL:
 
 | Setting | Value |
 |---------|-------|
-| Pressure Advance | 0.025 |
+| Pressure Advance | **Per tool** — measured 0.0367 / 0.0552 / 0.0647 on T0 / T1 / T2 (PLA, one spool). Do not copy these; run `PA_TUNE_T<n>` and let the machine measure your own |
 | Input Shaper X | EI @ 60.2 Hz |
 | Input Shaper Y | MZV @ 23.0 Hz |
 | Max Volumetric Flow (PLA 215C) | 10 mm³/s |
@@ -182,6 +262,7 @@ These values have been tuned on a 5-tool Prusa XL:
 | Document | Description |
 |----------|-------------|
 | [Installation Guide](docs/INSTALLATION_GUIDE.md) | Step-by-step setup from scratch |
+| [Pressure Advance Guide](docs/PRESSURE_ADVANCE.md) | Automatic per-tool PA tuning |
 | [OrcaSlicer Guide](orcaslicer/README.md) | Slicer configuration |
 | [Technical Specification](docs/SPECIFICATION.md) | MODBUS protocol, register maps, architecture |
 | [Motor Settings](docs/reference/motor_settings.md) | Pin assignments, TMC config, coordinates |
@@ -193,7 +274,9 @@ These values have been tuned on a 5-tool Prusa XL:
 
 - **Z+ = bed DOWN (safe), Z- = bed UP (crash risk)**
 - Tool offsets MUST be recalibrated for your specific machine
-- The XLBuddy requires DFU mode (physical jumper) for firmware flashing
+- **Breaking the XLBuddy appendix is permanent and cannot be undone.** It is required to flash unsigned firmware. Everything else about KlipperXL is reversible — stock Prusa firmware flashes back and the printer returns to normal — but this does not
+- **Normal flashing is from a USB drive** using Prusa's own bootloader — no jumper, no opening the printer. Build at offset `0x08020200` so the bootloader is preserved
+- **DFU is an advanced recovery method only.** It requires opening the printer and installing the **BOOT0 jumper** on the XLBuddy, and it flashes at `0x08000000` — which overwrites the Prusa bootloader, so USB `.bbf` flashing stops working until you put the bootloader back. That is recoverable: see [Section 12.5](docs/INSTALLATION_GUIDE.md#125-restoring-the-prusa-bootloader), which reflashes `firmware/recovery/bootloader-xl-2.5.0.bin`. Use DFU only if you have no working bootloader or no broken appendix seal
 - Dwarfs run stock Prusa firmware - do not modify them
 - Prusa XL hardware acceleration limit is 7000 mm/s² - never exceed this
 - Modular bed has a 120C maximum target temperature enforced in software
@@ -209,6 +292,27 @@ Copyright (C) 2026 Richard Crook
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [GNU General Public License](LICENSE) for more details.
+
+### Third-party components
+
+`pa_analysis/prusa_pa_tuner/` is **not** KlipperXL code. It is the Pressure
+Advance analysis library from
+[PrusaPATuner](https://github.com/CNCKitchen/PrusaPATuner) by **Stefan Hermann
+(CNC Kitchen)**, included unmodified under the **GNU Affero General Public
+License v3.0 or later**. It remains AGPL-licensed wherever it is copied.
+
+It is bundled rather than downloaded during installation so that KlipperXL stays
+buildable if the upstream repository ever becomes unavailable. It runs as a
+separate subprocess and is never imported into the Klipper process.
+
+See [`pa_analysis/prusa_pa_tuner/NOTICE`](pa_analysis/prusa_pa_tuner/NOTICE) for
+full attribution and licence details.
+
+## Acknowledgements
+
+- **Stefan Hermann / [CNC Kitchen](https://www.youtube.com/@CNCKitchen)** — the
+  loadcell Pressure Advance method and the analysis mathematics behind
+  KlipperXL's automatic PA tuning
 
 ---
 
