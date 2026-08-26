@@ -114,6 +114,13 @@ class DwarfPATuner:
         # no longer pause the unified Dwarf poll, so the other four toolheads keep
         # getting fed and their 30s comms watchdog is never at risk.
         self.max_record = config.getfloat('max_record_seconds', 1800., above=0.)
+        # Cross-section the sweep is allowed to reach, in mm^2. The PA test
+        # deliberately extrudes at high flow over a short oscillation -- that IS
+        # the measurement -- so it needs a far higher limit than printing does.
+        # See the relax/restore in _begin()/_end() for why this exists.
+        self.sweep_cross_section = config.getfloat(
+            'sweep_cross_section', 50., above=0.)
+        self._saved_extrude_ratio = None
         self._recording = False
         self._rec_timer = None
         self._rec_dwarf = None
@@ -343,6 +350,34 @@ class DwarfPATuner:
             self.reactor.pause(self.reactor.monotonic() + 0.05)
 
         self._recording = True
+        # RELAX THE EXTRUSION GUARD FOR THE DURATION OF THE SWEEP.
+        #
+        # printer.cfg ships max_extrude_cross_section: 4.0, which is correct for
+        # PRINTING -- it catches prime-line over-extrusion (the bug that caused
+        # it was ~5.4mm^2, so 4.0 catches it and anything above 30 would not).
+        # But the PA sweep deliberately extrudes at high flow over a short
+        # oscillation, which is the measurement itself, and it fails against
+        # that guard with:
+        #     Move exceeds maximum extrusion (30.000mm^2 vs 4.000mm^2)
+        #
+        # Raising the config value would re-open the hole the guard exists to
+        # close, so relax it ONLY while recording. _end() is idempotent teardown
+        # and always restores it, so a failed or aborted sweep cannot leave the
+        # machine unguarded.
+        self._saved_extrude_ratio = None
+        try:
+            extruder = self.printer.lookup_object('toolhead').get_extruder()
+            if extruder is not None and hasattr(extruder, 'max_extrude_ratio'):
+                self._saved_extrude_ratio = extruder.max_extrude_ratio
+                extruder.max_extrude_ratio = (self.sweep_cross_section
+                                              / extruder.filament_area)
+                logging.info("PA tuner: extrude guard relaxed to %.1fmm^2 for "
+                             "sweep (was %.3fmm^2)"
+                             % (self.sweep_cross_section,
+                                self._saved_extrude_ratio
+                                * extruder.filament_area))
+        except Exception as e:
+            logging.warning("PA tuner: could not relax extrude guard: %s" % (e,))
         self._rec_start = self.reactor.monotonic()
         if mode == 'poll':
             self._read_fifo(dwarf)          # drop stale queue
@@ -379,6 +414,17 @@ class DwarfPATuner:
         """Idempotent teardown -- safe to call twice, safe to call from the timer."""
         was_recording = self._recording
         self._recording = False
+        # Always put the extrusion guard back -- success, failure or abort.
+        if self._saved_extrude_ratio is not None:
+            try:
+                extruder = self.printer.lookup_object('toolhead').get_extruder()
+                if extruder is not None:
+                    extruder.max_extrude_ratio = self._saved_extrude_ratio
+                    logging.info("PA tuner: extrude guard restored")
+            except Exception as e:
+                logging.warning("PA tuner: could not restore extrude guard: %s"
+                                % (e,))
+            self._saved_extrude_ratio = None
         if getattr(self, '_mode', 'poll') != 'poll' and was_recording:
             try:
                 self._stream_stop_cmd.send()
