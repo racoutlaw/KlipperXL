@@ -488,6 +488,7 @@ class LoadcellProbe:
         # Setup loadcell parameters
         active_tool = self._puppy.active_tool
         if active_tool < 0:
+            toolhead.max_accel = orig_max_accel   # early exit - don't leak 500
             raise gcmd.error("No tool selected - cannot probe")
 
         modbus_addr = 0x1B + active_tool  # Dwarf address (T0=0x1B, T1=0x1C, etc.)
@@ -599,6 +600,15 @@ class LoadcellProbe:
             if "prior to movement" in str(e):
                 raise gcmd.error("Loadcell triggered before probe - check tare")
             raise
+        finally:
+            # RESTORE THE ACCELERATION LIMIT.
+            # This function drops max_accel to 500 (Prusa XY_ACCELERATION_MMSS)
+            # for precision probing but never put it back, so every bed mesh
+            # left the machine at 500 for the rest of the print. The slicer's
+            # first M204 masks it, which is why it only showed up as a slow
+            # prime line and opening layer. finally: covers the probe-failure
+            # paths as well as success.
+            toolhead.max_accel = orig_max_accel
 
         # Store result
         self._last_z_result = epos[2]
@@ -770,6 +780,10 @@ class LoadcellProbe:
             if "prior to movement" in str(e):
                 raise gcmd.error("Loadcell triggered before XY probe - check tare")
             raise
+        finally:
+            # Restore the probing acceleration limit on success or failure -
+            # same leak as run_probe had.
+            toolhead.max_accel = orig_max_accel
 
         # Report result
         if direction.startswith('X'):
@@ -780,6 +794,40 @@ class LoadcellProbe:
                               (direction, epos[1], epos[0], epos[2]))
 
         return epos[:3]
+
+    def _arc_move_to(self, toolhead, cx, cy, radius, target_angle,
+                     speed=25.0, max_step_deg=10.0):
+        """Travel around the pin to target_angle at constant radius AND Z.
+
+        Z is deliberately absent from every move here. The nozzle is a cone, so
+        the diameter that touches the pin flank depends entirely on the height
+        at contact - a 0.03mm Z error becomes a 0.03mm radius error, and the
+        circle fit inherits it. Prusa avoids this by never moving Z during the
+        XY sweep (G425.cpp probe_xy returns to the exact initial microstep
+        position) and by arcing between angles with plan_arc().
+
+        A straight line between opposite angles passes through the pin, which
+        is why the original code lifted Z to cross over the top. Arcing removes
+        the need for that lift entirely.
+        """
+        cur = toolhead.get_position()
+        dx, dy = cur[0] - cx, cur[1] - cy
+        cur_r = math.hypot(dx, dy)
+        cur_a = math.atan2(dy, dx) if cur_r > 1e-6 else target_angle
+
+        # Move radially out to the safety circle along the current bearing
+        if abs(cur_r - radius) > 1e-3:
+            toolhead.manual_move([cx + radius * math.cos(cur_a),
+                                  cy + radius * math.sin(cur_a), None], speed)
+
+        # Sweep to the target angle the short way round, in small steps
+        delta = (target_angle - cur_a + math.pi) % (2 * math.pi) - math.pi
+        steps = max(1, int(math.ceil(abs(math.degrees(delta)) / max_step_deg)))
+        for i in range(1, steps + 1):
+            a = cur_a + delta * i / steps
+            toolhead.manual_move([cx + radius * math.cos(a),
+                                  cy + radius * math.sin(a), None], speed)
+        toolhead.wait_moves()
 
     def _probe_xy_verified(self, gcmd, center_x, center_y, probe_z, angle_rad,
                            start_radius, probe_distance, speed, toolhead, pin_top_z):
@@ -794,14 +842,20 @@ class LoadcellProbe:
                 hit = self._probe_xy_at_angle(gcmd, center_x, center_y, probe_z, angle_rad,
                                               start_radius, probe_distance, speed)
                 samples.append(hit)
-                # Retract between samples
-                toolhead.manual_move([None, None, pin_top_z + 5], 10.0)
-                toolhead.wait_moves()
-                # Move back to start for next sample
+                # Return to the start point for the next sample WITHOUT touching
+                # Z. _probe_xy_at_angle has already retracted radially, so this
+                # is a short move straight back out along the same bearing - it
+                # cannot cross the pin.
+                #
+                # This used to lift to pin_top_z + 5 and drop back down, which
+                # re-established Z from scratch before every single sample. The
+                # nozzle is a cone, so the Z at contact sets which diameter
+                # touches the pin: any Z error became a radius error and went
+                # straight into the circle fit. Prusa returns to the exact
+                # initial microstep position instead (G425.cpp probe_xy).
                 start_x = center_x + start_radius * math.cos(angle_rad)
                 start_y = center_y + start_radius * math.sin(angle_rad)
                 toolhead.manual_move([start_x, start_y, None], 25.0)
-                toolhead.manual_move([None, None, probe_z], 10.0)
                 toolhead.wait_moves()
             
             # Calculate average
@@ -845,8 +899,14 @@ class LoadcellProbe:
         start_x = center_x + start_radius * math.cos(angle_rad)
         start_y = center_y + start_radius * math.sin(angle_rad)
 
-        # Move to start position
-        toolhead.manual_move([start_x, start_y, None], 25.0)
+        # Travel to the start point by ARCING around the pin at start_radius,
+        # never in a straight line - a straight move between opposite angles
+        # passes through the pin. Z is untouched by the arc.
+        self._arc_move_to(toolhead, center_x, center_y, start_radius, angle_rad)
+        # Assert the probing height. Once the sweep is under way this is a
+        # zero-length move; it matters only for the first angle after the Z
+        # probing phase. Mirrors Prusa's go_to_initial(), which restates Z
+        # after the arc for the same reason.
         toolhead.manual_move([None, None, probe_z], 10.0)
         toolhead.wait_moves()
 
@@ -1010,15 +1070,32 @@ class LoadcellProbe:
 
         The calibration pin is 6mm diameter, 9mm tall, installed at bed center.
 
-        PRUSA SEQUENCE (from selftest_tool_offsets.cpp):
-        1. User confirms start
-        2. Home X/Y ONLY (no Z bed probe!)
-        3. User installs sheet for cleaning
-        4. Heat nozzles, user cleans each one
-        5. Home X/Y again, park tools
-        6. User REMOVES sheet and INSTALLS calibration pin
-        7. Probe pin to establish Z reference (no bed involved)
+        ACTUAL SEQUENCE AS IMPLEMENTED (verified against the code 2026-08-21):
+        1. Turn off heaters
+        2. User installs the SHEET
+        3. Heat nozzles to CLEAN_TEMP, user cleans each one
+        4. Pick T0, run a FULL G28 - Z IS HOMED ON THE BED here - then park
+        5. User REMOVES sheet and INSTALLS the calibration pin
+        6. Wait for nozzles to reach CAL_TEMP
+        7. Probe the pin with every tool, offsets are ref - measured
         8. User removes pin and reinstalls sheet
+
+        The sheet must be ON for steps 2-4 and OUT for 5-7. Start with the
+        sheet installed and the pin in hand.
+
+        NOTE: an earlier version of this docstring claimed "Home X/Y ONLY (no
+        Z bed probe!)" and that the pin alone established Z. Both were wrong -
+        step 4 calls G28, which homes Z against the bed through
+        [homing_override]. Corrected here because it misleads anyone reasoning
+        about where the Z reference comes from.
+
+        WAIT_TIME is a plain timed pause, NOT a confirmation prompt. The
+        sequence continues whether the user is ready or not, so allow enough
+        time for the physical sheet/pin swap (WAIT_TIME=120 is realistic).
+
+        SPEED= sets the XY probing feedrate only. The Z samples go through
+        run_probe(), which uses PROBE_SPEED= (default: the probe's own
+        configured speed, 1.0 mm/s).
         """
         # Parameters - matching Prusa's G425 methodology
         pin_x = gcmd.get_float('PIN_X', 180.0)
@@ -1032,6 +1109,11 @@ class LoadcellProbe:
         cal_temp = gcmd.get_float('CAL_TEMP', 70.0)  # Prusa TOOL_CALIBRATION_TEMPERATURE = 70C
         clean_time = gcmd.get_float('CLEAN_TIME', 30.0)  # Seconds per tool for cleaning
         wait_time = gcmd.get_float('WAIT_TIME', 30.0)  # Seconds to wait for user actions
+        # DRY_RUN=1 probes and reports exactly as normal but writes NOTHING -
+        # neither the runtime offsets nor printer.cfg. Without it this command
+        # is all-or-nothing: 20 minutes of probing that SAVE_CONFIGs over a
+        # working calibration with no way to preview the result first.
+        dry_run = gcmd.get_int('DRY_RUN', 0)
 
         # Prusa G425 phased probing constants (from G425.cpp)
         PROBE_Z_BORE_MM = 1.0           # XY probing depth below pin top
@@ -1061,6 +1143,16 @@ class LoadcellProbe:
             raise gcmd.error("Invalid TOOLS parameter - use comma-separated numbers")
 
         toolhead = self._printer.lookup_object('toolhead')
+
+        if dry_run:
+            gcmd.respond_info("*** DRY RUN - nothing will be saved ***")
+        # NOTE: SPEED= only affects XY probing. The Z samples go through
+        # run_probe(), which takes PROBE_SPEED= (default self._speed).
+        # Two different knobs - report both so the log is unambiguous.
+        z_probe_speed = gcmd.get_float('PROBE_SPEED', self._speed, above=0.)
+        gcmd.respond_info("Tools: %s   XY speed: %.2f mm/s   Z speed: %.2f mm/s"
+                          % (','.join(str(t) for t in tool_list),
+                             probe_speed, z_probe_speed))
 
         # Prusa XY_ACCELERATION_MMSS limit (500 mm/s^2) for precision probing
         orig_max_accel = toolhead.max_accel
@@ -1100,6 +1192,15 @@ class LoadcellProbe:
         for tool_num in tool_list:
             dwarf_num = tool_num + 1
             gcode.run_script_from_command("SET_DWARF_TEMP DWARF=%d TEMP=0" % dwarf_num)
+            # ALSO clear any cooling fan left running by a PREVIOUS aborted run.
+            # The fan lives in the Dwarf's own register (0xE002); a Klipper
+            # restart does not reset it, so a calibration cancelled between
+            # "fans on" and "fans off" leaves that tool blowing indefinitely.
+            # Observed 2026-08-22: T0 and T1 still running hours later.
+            # A cancelled run can also leave the Dwarf latched, so release the
+            # latch first, then force the fan off.
+            self._puppy._fan_selftest_exit(dwarf_num)
+            self._puppy._fan_write(dwarf_num, 0)
 
         # === STEP 2: User installs sheet (Prusa: ToolOffsets_wait_user_install_sheet) ===
         if not skip_clean:
@@ -1113,6 +1214,24 @@ class LoadcellProbe:
 
             # === STEP 3: Nozzle cleaning phase ===
             gcmd.respond_info("=== STEP 3: NOZZLE CLEANING PHASE ===")
+
+            # The cleaning phase drives each tool to a fixed position, which
+            # needs a homed machine. This used to work only by accident: the
+            # tool change auto-homes XY, so as long as a DIFFERENT tool was
+            # picked the machine ended up homed in passing. Start with the
+            # target tool already on the carriage and nothing homes - the move
+            # then fails with "Must home axis first" and the whole calibration
+            # aborts. Home explicitly instead of relying on a side effect.
+            # Safe here: the sheet is installed at STEP 2, so a Z home against
+            # the bed is correct (and the pin is not in yet).
+            th_status = toolhead.get_status(self._puppy.reactor.monotonic())
+            homed_axes = th_status.get('homed_axes', '')
+            if not all(axis in homed_axes for axis in 'xyz'):
+                gcmd.respond_info("Machine not homed (homed_axes=%r) - homing "
+                                  "before cleaning..." % homed_axes)
+                gcode.run_script_from_command("G28")
+                toolhead.wait_moves()
+
             gcmd.respond_info("Heating all nozzles to %.0fC for cleaning..." % clean_temp)
 
             # Heat all nozzles using SET_DWARF_TEMP (MODBUS direct control)
@@ -1159,6 +1278,32 @@ class LoadcellProbe:
         else:
             gcmd.respond_info("Skipping nozzle cleaning (SKIP_CLEAN=1)")
 
+        # START COOLING NOW, not at STEP 6.
+        #
+        # Cooling from the cleaning temperature down to CAL_TEMP is the longest
+        # unavoidable wait in this routine, and it can run entirely in the
+        # background while the user removes the sheet and fits the pin, and
+        # while the machine homes. Prusa does exactly this: state_clean_nozzle
+        # calls set_nozzle_temps(TOOL_CALIBRATION_TEMPERATURE) and
+        # FanCoolingManager::cooldown() the moment cleaning ends, and only
+        # reaches state_wait_stable_temp after the pin is installed - by which
+        # point there is usually nothing left to wait for.
+        gcmd.respond_info("")
+        gcmd.respond_info("Setting nozzles to %.0fC and cooling in the "
+                          "background..." % cal_temp)
+        for tool_num in tool_list:
+            dwarf_num = tool_num + 1
+            gcode.run_script_from_command(
+                "SET_DWARF_TEMP DWARF=%d TEMP=%.0f" % (dwarf_num, cal_temp))
+            temp = self._puppy.dwarf_data.get(dwarf_num, {}).get(
+                'hotend_temp', 0)
+            if temp > cal_temp + 5:
+                # Latched, so the TOOL_PARK in STEP 4 cannot stop it - this is
+                # Prusa's FanCoolingManager::start_cooling(), which calls
+                # enter_selftest_mode() then selftest_set_pwm(255).
+                self._puppy._fan_selftest_enter(dwarf_num)
+                self._puppy._fan_selftest_set(dwarf_num, 255)
+
         # === STEP 4: Home and park (Prusa: state_home_park) ===
         gcmd.respond_info("")
         gcmd.respond_info("=== STEP 4: HOMING AND PARKING FOR PIN INSTALL ===")
@@ -1199,19 +1344,58 @@ class LoadcellProbe:
             dwarf_num = tool_num + 1
             gcode.run_script_from_command("SET_DWARF_TEMP DWARF=%d TEMP=%.0f" % (dwarf_num, cal_temp))
 
-        # Wait for temps to reach cal_temp (heat up OR cool down)
+        # Wait for temps to reach cal_temp (heat up OR cool down).
+        #
+        # FAN-ASSISTED, AND WAITS ON ALL TOOLS IN PARALLEL.
+        # Prusa drives the print and heatbreak fans to 100% on any tool sitting
+        # above the calibration temperature, and stops each fan as that tool
+        # arrives (selftest_tool_offsets.cpp, FanCoolingManager). Falling from
+        # the cleaning temperature to 70C without help is the single longest
+        # stretch of this routine. Only the print fan is reachable from here
+        # (register 0xE002 via M106); the heatbreak fan has no exposed command.
+        cooling = set()
         for tool_num in tool_list:
             dwarf_num = tool_num + 1
             temp = self._puppy.dwarf_data.get(dwarf_num, {}).get('hotend_temp', 0)
             if temp > cal_temp + 5:
-                gcmd.respond_info("T%d at %.0fC - waiting to cool to %.0fC..." % (tool_num, temp, cal_temp))
+                self._puppy._fan_selftest_enter(dwarf_num)
+                self._puppy._fan_selftest_set(dwarf_num, 255)
+                cooling.add(tool_num)
+                gcmd.respond_info("T%d at %.0fC - fan ON, cooling to %.0fC..."
+                                  % (tool_num, temp, cal_temp))
             else:
-                gcmd.respond_info("Waiting for T%d to reach %.0fC..." % (tool_num, cal_temp))
-            while True:
-                temp = self._puppy.dwarf_data.get(dwarf_num, {}).get('hotend_temp', 0)
-                if cal_temp - 5 <= temp <= cal_temp + 5:
-                    break
-                self._puppy.reactor.pause(self._puppy.reactor.monotonic() + 1.0)
+                # Already at temperature - make sure the background cooling fan
+                # started back at STEP 3 is off, or it would run through the
+                # entire probing phase.
+                self._puppy._fan_selftest_exit(dwarf_num)
+                gcmd.respond_info("Waiting for T%d to reach %.0fC..."
+                                  % (tool_num, cal_temp))
+
+        # try/finally so an abort in here cannot leave fans running. Prusa gets
+        # this for free - FanCoolingManager::reset() is in the destructor of
+        # CSelftestPart_ToolOffsets, so it runs however the routine exits.
+        # Python needs it said out loud.
+        try:
+            pending = list(tool_list)
+            while pending:
+                for tool_num in list(pending):
+                    dwarf_num = tool_num + 1
+                    temp = self._puppy.dwarf_data.get(dwarf_num, {}).get('hotend_temp', 0)
+                    if cal_temp - 5 <= temp <= cal_temp + 5:
+                        pending.remove(tool_num)
+                        if tool_num in cooling:
+                            self._puppy._fan_selftest_exit(tool_num + 1)
+                            cooling.discard(tool_num)
+                        gcmd.respond_info("T%d at %.0fC - ready" % (tool_num, temp))
+                if pending:
+                    self._puppy.reactor.pause(self._puppy.reactor.monotonic() + 1.0)
+        finally:
+            # Never leave a cooling fan running - on success OR on abort.
+            # exit_selftest_mode() restores the pre-latch PWM, so this is now
+            # a true equivalent of FanCoolingManager::reset() in the
+            # CSelftestPart_ToolOffsets destructor.
+            for tool_num in list(cooling):
+                self._puppy._fan_selftest_exit(tool_num + 1)
 
         gcmd.respond_info("All nozzles at calibration temperature!")
 
@@ -1223,6 +1407,14 @@ class LoadcellProbe:
         # Bed compensation would shift Z positions and corrupt measurements
         gcmd.respond_info("Clearing bed mesh for calibration...")
         gcode.run_script_from_command("BED_MESH_CLEAR")
+
+        # Keep a copy of what was in use BEFORE zeroing. Two uses:
+        #   1. the MEASURED vs CURRENT table - reading the live dict after this
+        #      point would compare against zeros, not the real values
+        #   2. DRY_RUN has to put them back, since it never reaches the code
+        #      that would otherwise overwrite them
+        saved_offsets = dict(self._puppy.tool_offsets)
+        saved_applied = self._puppy.applied_tool_offset
 
         # Reset all tool offsets before calibration (Prusa: reset_hotend_offsets)
         # Old offsets would shift tool positions during probing and corrupt measurements
@@ -1308,13 +1500,21 @@ class LoadcellProbe:
                 if num_z > 0:
                     gcmd.respond_info("    Probing Z (%d samples)..." % num_z)
 
-                    # Move to current center XY
-                    toolhead.manual_move([current_center[0], current_center[1], None], 25.0)
-                    toolhead.wait_moves()
-
-                    # Move to clearance above expected pin top
+                    # RAISE Z FIRST, THEN TRAVEL IN XY.
+                    #
+                    # The order matters far more than it looks. Coming out of an
+                    # XY sweep the nozzle sits BELOW the pin top, so moving in XY
+                    # first drags it straight through the pin - a lateral crash
+                    # into steel. That is exactly what happened on 2026-08-21.
+                    # Prusa's probe_z() sets Z before any XY move for this reason
+                    # (G425.cpp: current_position.z = ...; calibration_move();
+                    # only then does it apply the XY offset).
                     probe_start_z = pin_height + clearance
                     toolhead.manual_move([None, None, probe_start_z], 10.0)
+                    toolhead.wait_moves()
+
+                    # Now clear of the pin - safe to travel in XY
+                    toolhead.manual_move([current_center[0], current_center[1], None], 25.0)
                     toolhead.wait_moves()
 
                     z_samples = []
@@ -1360,9 +1560,28 @@ class LoadcellProbe:
                         gcmd.respond_info("      XY probe %d FAILED: %s" % (i+1, str(e)))
                         raise
 
-                    # Retract to safe height after each XY probe
-                    toolhead.manual_move([None, None, current_center[2] + clearance], 10.0)
+                    # NO Z retract between angles. The next _probe_xy_at_angle
+                    # arcs around the pin at start_radius (8mm vs a 3mm pin =
+                    # 5mm clearance), so there is nothing to lift over. Keeping
+                    # Z frozen for the whole sweep is the entire point: it is
+                    # what stops nozzle-taper error entering the circle fit.
                     toolhead.wait_moves()
+
+                # SWEEP FINISHED - LIFT CLEAR NOW.
+                #
+                # The nozzle is currently PROBE_Z_BORE_MM below the pin top, out
+                # at start_radius. Everything after this moves in XY first and
+                # sets Z second (the Z probing below, and the next phase), so
+                # leaving it down here drives the nozzle sideways through the
+                # pin. That is a lateral crash into steel, and it is what
+                # happened on 2026-08-21 when this lift was removed along with
+                # the per-angle retracts.
+                #
+                # Prusa does the same thing: probe_z() raises Z before any XY
+                # move, and get_xyz_center() ends with go_to_safe_height().
+                toolhead.manual_move(
+                    [None, None, current_center[2] + clearance], 10.0)
+                toolhead.wait_moves()
 
                 # Fit circle to find center
                 center_xy = self._fit_circle_center(hits)
@@ -1421,11 +1640,13 @@ class LoadcellProbe:
         gcode.run_script_from_command("TOOL_PARK")
         toolhead.wait_moves()
 
-        # Turn off heaters
+        # Turn off heaters AND any cooling fan this routine switched on
         gcmd.respond_info("Turning off heaters...")
         for tool_num in tool_list:
             dwarf_num = tool_num + 1
             gcode.run_script_from_command("SET_DWARF_TEMP DWARF=%d TEMP=0" % dwarf_num)
+            self._puppy._fan_selftest_exit(dwarf_num)
+            self._puppy._fan_write(dwarf_num, 0)
 
         # === STEP 8: User removes pin and reinstalls sheet ===
         gcmd.respond_info("")
@@ -1438,6 +1659,43 @@ class LoadcellProbe:
         self._puppy.reactor.pause(self._puppy.reactor.monotonic() + wait_time)
 
         gcmd.respond_info("=== CALIBRATION COMPLETE ===")
+
+        # Comparison against what is currently in use - the useful part of a
+        # dry run, and worth printing either way.
+        gcmd.respond_info("")
+        gcmd.respond_info("=== MEASURED vs CURRENT ===")
+        gcmd.respond_info("        current Z    measured Z     change")
+        for tool_num in sorted(offsets.keys()):
+            # saved_offsets, NOT the live dict - the live one was zeroed above
+            cur_z = saved_offsets.get(tool_num, (0., 0., 0.))[2]
+            new_z = offsets[tool_num][2]
+            gcmd.respond_info("  T%d:   %+8.4f    %+8.4f    %+8.4f"
+                              % (tool_num, cur_z, new_z, new_z - cur_z))
+
+        if dry_run:
+            # Put back what calibration zeroed. Without this a dry run leaves
+            # the machine with no tool offsets applied until the next restart,
+            # which would silently ruin the next multi-tool print.
+            self._puppy.tool_offsets.update(saved_offsets)
+            self._puppy.applied_tool_offset = saved_applied
+            active = self._puppy.active_tool
+            if active is not None and active >= 0:
+                try:
+                    self._puppy._reapply_tool_offset(active)
+                except Exception as e:
+                    logging.warning("DRY_RUN offset restore failed: %s" % (e,))
+            gcmd.respond_info("")
+            gcmd.respond_info("=== DRY RUN - NOTHING WAS SAVED ===")
+            gcmd.respond_info("Tool offsets restored to their previous values,")
+            gcmd.respond_info("and printer.cfg was not written.")
+            gcmd.respond_info("Re-run without DRY_RUN=1 to apply.")
+            gcmd.respond_info("")
+            gcmd.respond_info("NOTE: applying these means the per-tool babystep")
+            gcmd.respond_info("values (tN_z_offset) were tuned against the OLD")
+            gcmd.respond_info("offsets, so re-do the first-layer babystep pass on")
+            gcmd.respond_info("each tool afterwards.")
+            self._tool_offsets = offsets
+            return offsets
 
         # Apply offsets to working storage (used during tool changes)
         for tool_num, (ox, oy, oz) in offsets.items():
@@ -1716,8 +1974,35 @@ class PuppyBootloader:
         self.active_tool = 0  # -1 = no tool picked, 0-4 = T0-T4 (default 0 for dev)
         self.target_temps = {}  # {dwarf_num: target_temp}
         self.fan_speeds = {}  # {dwarf_num: speed 0-255}
+        # THE PRINT FAN. The XL has one logical print fan whose PWM is routed
+        # to whichever tool is active - hwio_XLBuddy.cpp analogWrite() does
+        # Fans::print(active_extruder).set_pwm(value), where a single-tool
+        # board does Fans::print(0). Slicers only ever emit bare "M106 S<x>"
+        # because they assume one fan; a real 5-tool print here had 699 M106
+        # and ZERO M107 across 45 toolchanges. Without a print fan value that
+        # follows the tool, any tool parked while blowing keeps blowing - the
+        # speed is stranded in that Dwarf's own 0xE002 register and nothing
+        # ever clears it.
+        self.print_fan_speed = 0  # Marlin's fan_speed[0] equivalent
+        # Per-Dwarf selftest latch, mirroring CFanCtl3Wire::selftest_mode.
+        # While a Dwarf is latched, ordinary fan writes are ignored and the
+        # stored value is the PWM restored on exit. This is what lets the tool
+        # offset cooldown run fans on PARKED tools without a toolchange
+        # stomping them (CFanCtl3Wire.cpp:251 - set_pwm() returns false in
+        # selftest_mode).
+        self.fan_selftest = {}  # {dwarf_num: pwm to restore on exit}
         self.tmc_enabled = {}  # {dwarf_num: True/False}
         self.tool_picked = False  # True if a tool is on the carriage
+        # Tool whose nozzle established Z=0 at the last Z home. Applied tool
+        # offsets are relative to THIS tool, not unconditionally to T0.
+        # Set by SET_Z_DATUM_TOOL from [homing_override], on the same line that
+        # defines Z=0. Defaults to 0 because homing has always picked T0, and
+        # tool_offset_t0 is 0,0,0 - so the rebase is a no-op until Z homing
+        # actually moves to another tool.
+        self.z_home_tool = 0
+        # True when this print homed Z with the printing tool itself, so cal_z
+        # cancels out and the single-tool squish slot applies.
+        self.single_tool_mode = False
         self.led_pending = set()  # Dwarfs needing cheese LED config retry
         self.tool_remap = {}  # {gcode_tool: physical_tool} for spool join
         self._button_extrude_active = False  # True while button-driven extrude is in progress
@@ -1867,6 +2152,8 @@ class PuppyBootloader:
             desc="Set individual bedlet temperature")
         self.gcode.register_command("SET_DWARF_TEMP", self.cmd_SET_DWARF_TEMP,
             desc="Set Dwarf heater temperature directly")
+        self.gcode.register_command("DISABLE_ALL_HOTENDS", self.cmd_DISABLE_ALL_HOTENDS,
+            desc="Turn off every booted Dwarf hotend heater")
         # Adaptive bed heating commands
         self.gcode.register_command("SET_BED_AREA", self.cmd_SET_BED_AREA,
             desc="Set print area for adaptive bed heating")
@@ -1876,6 +2163,8 @@ class PuppyBootloader:
         # Prusa XL slicer compatibility commands
         self.gcode.register_command("M151", self.cmd_M151,
             desc="Set LED strip color (stub)")
+        self.gcode.register_command("M142", self.cmd_M142,
+            desc="Set heatbreak cooling target (accepted, Dwarf-regulated)")
         self.gcode.register_command("P0", self.cmd_P0,
             desc="Park current tool")
         self.gcode.register_command("M17", self.cmd_M17,
@@ -2022,6 +2311,8 @@ class PuppyBootloader:
             desc="Z probe using loadcell on active tool")
         self.gcode.register_command("Z_CALIBRATION_RUN", self.cmd_Z_CALIBRATION,
             desc="Z Calibration internal command (use Z_CALIBRATION macro instead)")
+        self.gcode.register_command("SET_Z_DATUM_TOOL", self.cmd_SET_Z_DATUM_TOOL,
+            desc="Record which tool's nozzle established Z=0 (called by G28)")
 
         # Initialize accelerometer support for input shaper calibration
         self.accelerometer = None
@@ -2040,6 +2331,81 @@ class PuppyBootloader:
         """Called during MCU config phase - add config commands here"""
         self.mcu.add_config_cmd("config_modbus")
         logging.info("PuppyBootloader: Added config_modbus command")
+
+    def _z_datum_cal_z(self):
+        """cal_z of the tool that established Z=0 at the last Z home.
+
+        Z=0 is wherever the homing tool's nozzle touched the bed, so a tool's
+        applied Z offset is the DIFFERENCE between its own cal_z and the homing
+        tool's - not its raw cal_z, which silently assumes T0 did the homing.
+
+        Homing on T0 gives cal_z = 0 here, leaving every applied offset exactly
+        as it was before this existed.
+        """
+        return self.tool_offsets.get(self.z_home_tool, (0.0, 0.0, 0.0))[2]
+
+    def _use_single_slot(self, tool):
+        """True when 'tool' should use its single-tool squish value.
+
+        BOTH conditions are required: the job declared itself single-tool, AND
+        this tool is the one that actually established Z=0. The second test
+        matters because single_tool_mode persists after the print ends - a
+        later toolchange to some other tool must not read that tool's
+        single-tool value, since that tool never homed itself.
+        """
+        return bool(self.single_tool_mode) and tool == self.z_home_tool
+
+    def _reapply_tool_offset(self, tool):
+        """Recompute and re-send the gcode offset for 'tool'.
+
+        Needed because the offset is applied when a tool is PICKED, but the Z
+        datum is not established until G28 Z runs afterwards. Any offset
+        applied before that was computed against the old datum and is stale
+        the moment the datum moves.
+        """
+        offset = self.tool_offsets.get(tool, (0.0, 0.0, 0.0))
+        ox, oy, oz = offset
+        tool_z_adj = 0.0
+        tool_offsets_mod = self.printer.lookup_object('tool_offsets', None)
+        if tool_offsets_mod is not None:
+            tool_z_adj = tool_offsets_mod.get_z_offset(
+                tool, single=self._use_single_slot(tool))
+        total_z = -(oz - self._z_datum_cal_z()) + tool_z_adj
+        self.gcode.run_script_from_command(
+            f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} MOVE=0")
+        self.applied_tool_offset = offset
+        logging.info(
+            f"PuppyBootloader: Re-applied T{tool} offset after datum change: "
+            f"Z={total_z:.4f} (cal_z={oz:.4f}, datum_cal_z="
+            f"{self._z_datum_cal_z():.4f}, adj={tool_z_adj:.4f})")
+
+    def cmd_SET_Z_DATUM_TOOL(self, gcmd):
+        """Record which tool's nozzle established Z=0.
+
+        Usage: SET_Z_DATUM_TOOL [TOOL=<n>]     (default: the active tool)
+
+        Called from [homing_override] immediately after the loadcell probe sets
+        Z=0. It is NOT hooked to LOADCELL_PROBE, because LOADCELL_TEST calls
+        that same command without establishing a datum - which would leave the
+        datum claiming a tool that never homed.
+        """
+        tool = gcmd.get_int('TOOL', None)
+        if tool is None:
+            tool = self.active_tool if self.active_tool >= 0 else 0
+        if tool < 0 or tool > 4:
+            raise gcmd.error(f"SET_Z_DATUM_TOOL: invalid tool {tool}")
+        self.z_home_tool = tool
+        self.single_tool_mode = bool(gcmd.get_int('SINGLE', 0))
+        cal_z = self.tool_offsets.get(tool, (0.0, 0.0, 0.0))[2]
+        logging.info(f"PuppyBootloader: Z datum tool = T{tool} "
+                     f"(cal_z={cal_z:.4f}, "
+                     f"mode={'SINGLE' if self.single_tool_mode else 'MULTI'})")
+        # The datum just moved, so any offset applied at tool-pick time was
+        # computed against the OLD datum. Re-apply it now or the machine runs
+        # on a stale number - which is exactly what put the first layer down
+        # in the wrong place on 2026-08-20.
+        if self.tool_picked and self.active_tool >= 0:
+            self._reapply_tool_offset(self.active_tool)
 
     def _load_tool_offsets(self):
         """Load tool offsets from printer.cfg [puppy_bootloader] section.
@@ -2454,6 +2820,22 @@ class PuppyBootloader:
         if tool != self.active_tool:
             return
 
+        # A COLD nozzle cannot be consuming filament, so a runout from one is
+        # meaningless. Without this, starting a print while a previous
+        # operation left a DIFFERENT, empty tool on the carriage pauses the job
+        # during START_PRINT's setup - before step 3 has parked that tool.
+        # Observed 2026-08-25: a PA tune left T4 mounted and empty, a T3-only
+        # print began, T4's side sensor cried runout, and PAUSE then FAILED
+        # with "Extrude below minimum temp" because nothing was hot yet -
+        # leaving the job half-paused. 170C matches Prusa EXTRUDE_MINTEMP and
+        # is the same bar PAUSE itself has to clear, so the cascade cannot
+        # happen either.
+        dwarf = tool + 1
+        hotend_temp = self.dwarf_data.get(dwarf, {}).get('hotend_temp', 0)
+        if hotend_temp < 170:
+            self.side_fs_runout_count[tool] = 0
+            return
+
         # Only check during actual printing
         try:
             print_stats = self.printer.lookup_object('print_stats', None)
@@ -2555,7 +2937,37 @@ class PuppyBootloader:
         except Exception:
             return None
 
-    def _do_autoload(self, tool):
+    def _clear_melt_retract(self, tool, from_command=True):
+        """Forget END_PRINT's deep retract for a tool after a load or unload.
+
+        END_PRINT and CANCEL_PRINT pull E-20 out of the melt zone on purpose and
+        record it in save_variables (melt_retract_tN) so the next START_PRINT can
+        give back exactly what was taken instead of making the part pay for it.
+
+        A load refills that void itself and an unload empties the whole path, so
+        either one invalidates the record. Without this, loading filament by hand
+        after a finished print would leave the flag standing and START_PRINT would
+        push 20mm into an already-full hot end.
+
+        from_command: True inside a gcode command handler (the mutex is already
+        held), False from the poll/reactor context, matching the surrounding code.
+        """
+        try:
+            sv = self.printer.lookup_object('save_variables', None)
+            if sv is None:
+                return
+            if not sv.allVariables.get('melt_retract_t%d' % tool):
+                return
+            script = "SAVE_VARIABLE VARIABLE=melt_retract_t%d VALUE=0" % tool
+            if from_command:
+                self.gcode.run_script_from_command(script)
+            else:
+                self.gcode.run_script(script)
+        except Exception:
+            logging.exception(
+                "PuppyBootloader: could not clear melt_retract_t%d" % tool)
+
+    def _do_autoload(self, tool, from_command=False):
         """Execute autoload sequence for a tool (Prusa M1701 equivalent).
 
         Matches Prusa's stock firmware autoload sequence:
@@ -2568,7 +2980,25 @@ class PuppyBootloader:
         6. Purge: 27mm @ 2.7mm/s (prime nozzle)
         7. Retract: 4mm @ 35mm/s (prevent ooze)
         8. Turn off heater
+
+        from_command MUST reflect how we got here, because the two callers hold
+        different locks:
+
+        - False (default): the side sensor saw filament go in and scheduled us
+          through _do_autoload_async on a reactor callback. No gcode mutex is
+          held, so run_script is right - it takes the mutex and serialises us
+          against anything else the dispatcher is doing.
+
+        - True: AUTOLOAD_FILAMENT was typed. GCodeDispatch already holds the
+          mutex for the duration of the command handler, and ReactorMutex is
+          NOT reentrant (reactor.py: __enter__ parks the greenlet on
+          reactor.pause(NEVER)). Calling run_script there would make the
+          command wait for a lock only it can release - Klipper hangs until
+          restart. run_script_from_command skips the mutex, which is safe
+          precisely because we already own it.
         """
+        run = (self.gcode.run_script_from_command if from_command
+               else self.gcode.run_script)
         dwarf = tool + 1
         if dwarf not in self.booted_dwarfs:
             self.gcode.respond_info(
@@ -2586,7 +3016,7 @@ class PuppyBootloader:
         # Pick tool if not active
         if self.active_tool != tool:
             self.gcode.respond_info(f"Picking T{tool}...")
-            self.gcode.run_script(f"T{tool}")
+            run(f"T{tool}")
 
         toolhead = self.printer.lookup_object('toolhead')
 
@@ -2619,7 +3049,7 @@ class PuppyBootloader:
                         f"assist @ 5.4mm/s, state={cur_state}")
             self.gcode.respond_info(
                 f"T{tool}: Extruder turning - push filament in...")
-            self.gcode.run_script("G92 E0")
+            run("G92 E0")
 
             chunk_mm = 2.0
             speed = 5.4  # Prusa FILAMENT_CHANGE_SLOW_LOAD_FEEDRATE
@@ -2664,11 +3094,11 @@ class PuppyBootloader:
             self.gcode.respond_info(f"T{tool}: Heating to {temp}C...")
             logging.info(f"PuppyBootloader: Autoload T{tool} phase 2: "
                         f"heating to {temp}C via M109")
-            self.gcode.run_script(f"M109 T{tool} S{temp}")
+            run(f"M109 T{tool} S{temp}")
             logging.info(f"PuppyBootloader: Autoload T{tool} M109 returned")
 
             # --- Phase 3: Fast load 50mm @ 18mm/s (gear to nozzle) ---
-            self.gcode.run_script("G92 E0")
+            run("G92 E0")
             self.gcode.respond_info(f"T{tool}: Fast loading to nozzle...")
             logging.info(f"PuppyBootloader: Autoload T{tool} phase 3: "
                         f"fast load 50mm @ 18mm/s")
@@ -2695,7 +3125,9 @@ class PuppyBootloader:
             toolhead.wait_moves()
 
             # --- Phase 6: Turn off heater ---
-            self.gcode.run_script(f"M104 T{tool} S0")
+            run(f"M104 T{tool} S0")
+            # The hot end is full again - drop any END_PRINT deep-retract record
+            self._clear_melt_retract(tool, from_command=from_command)
             self.gcode.respond_info(f"T{tool}: Autoload complete!")
             logging.info(f"PuppyBootloader: Autoload T{tool} complete")
 
@@ -2825,7 +3257,8 @@ class PuppyBootloader:
             raise gcmd.error("Autoload already in progress")
         try:
             self._autoload_in_progress = True
-            self._do_autoload(tool)
+            # Typed command: the gcode mutex is already held on our behalf.
+            self._do_autoload(tool, from_command=True)
         except Exception as e:
             raise gcmd.error(f"Autoload failed: {e}")
         finally:
@@ -3047,6 +3480,10 @@ class PuppyBootloader:
         self.gcode.run_script_from_command("G1 E-80 F1620")
         self.gcode.run_script_from_command("G92 E0")
 
+        # Whole path is empty now - the END_PRINT deep-retract record is stale.
+        # The next load refills the hot end, so START_PRINT must not add to it.
+        self._clear_melt_retract(tool)
+
         # Check sensor
         data = self.dwarf_data.get(dwarf, {})
         raw = data.get('filament_sensor', 0)
@@ -3133,6 +3570,9 @@ class PuppyBootloader:
         # Retract to prevent ooze: 35mm/s = 2100mm/min, 4mm
         self.gcode.run_script_from_command("G1 E-4 F2100")
         self.gcode.run_script_from_command("G92 E0")
+
+        # The hot end is full again - drop any END_PRINT deep-retract record
+        self._clear_melt_retract(tool)
 
         gcmd.respond_info(f"T{tool}: Filament loaded and purged")
 
@@ -4761,6 +5201,16 @@ class PuppyBootloader:
                 if new_dwarf in self.booted_dwarfs:
                     self.tool_picked = True
 
+                # Print fan follows the tool (toolchanger.cpp:345-349). Prusa
+                # keys this on old_dwarf != nullptr, not on a physical park -
+                # and this path never calls TOOL_PARK, so it has to do both
+                # halves itself: off on the outgoing Dwarf, print fan value
+                # onto the incoming one.
+                if old_dwarf > 0 and old_dwarf != new_dwarf:
+                    self._fan_park_tool(old_dwarf)
+                if new_dwarf in self.booted_dwarfs:
+                    self._fan_apply_to_tool(new_dwarf)
+
                 # Wait for sensor to pick up new tool's temperature
                 self.reactor.pause(self.reactor.monotonic() + 0.2)
 
@@ -4812,8 +5262,10 @@ class PuppyBootloader:
                     tool_z_adj = 0.0
                     tool_offsets_mod = self.printer.lookup_object('tool_offsets', None)
                     if tool_offsets_mod is not None:
-                        tool_z_adj = tool_offsets_mod.get_z_offset(physical_tool)
-                    total_z = -oz + tool_z_adj
+                        tool_z_adj = tool_offsets_mod.get_z_offset(
+                            physical_tool,
+                            single=self._use_single_slot(physical_tool))
+                    total_z = -(oz - self._z_datum_cal_z()) + tool_z_adj
                     self.gcode.run_script_from_command(
                         f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} MOVE=0")
                     self.applied_tool_offset = offset
@@ -7003,6 +7455,12 @@ class PuppyBootloader:
         self.tool_picked = True
         self.gcode.respond_info(f"T{tool} extruder TMC enabled")
 
+        # Route the print fan to the tool just picked (toolchanger.cpp:345,
+        # "fan on new dwarf will be enabled by marlin"). Marlin re-applies
+        # fan_speed[0] through active_extruder continuously; Klipper has no
+        # equivalent loop, so it is written once here.
+        self._fan_apply_to_tool(dwarf)
+
         # Wait for MODBUS to complete and sensor to pick up new tool's temperature
         self.reactor.pause(self.reactor.monotonic() + 0.2)
 
@@ -7043,8 +7501,9 @@ class PuppyBootloader:
         tool_z_adj = 0.0
         tool_offsets_mod = self.printer.lookup_object('tool_offsets', None)
         if tool_offsets_mod is not None:
-            tool_z_adj = tool_offsets_mod.get_z_offset(tool)
-        total_z = -oz + tool_z_adj
+            tool_z_adj = tool_offsets_mod.get_z_offset(
+                tool, single=self._use_single_slot(tool))
+        total_z = -(oz - self._z_datum_cal_z()) + tool_z_adj
         self.gcode.run_script_from_command(
             f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} MOVE=0")
 
@@ -7355,6 +7814,15 @@ class PuppyBootloader:
             self._write_coil(dwarf, 0x4000, False)  # TMC disable
             self.tmc_enabled[dwarf] = False
 
+        # PRINT FAN OFF on the tool being parked. Prusa does exactly this,
+        # toolchanger.cpp:345 - "Disable print fan on old dwarf, fan on new
+        # dwarf will be enabled by marlin". Without it the speed stays in this
+        # Dwarf's 0xE002 register and the tool blows in its dock for the rest
+        # of the print and beyond: the slicer never sends M107 to clear it.
+        # Skipped for a Dwarf held by the selftest latch, so the tool offset
+        # cooldown can keep fans running on parked tools.
+        self._fan_park_tool(dwarf)
+
         # MULTI-TOOL FIX: Re-send heater target after deselect
         # The Dwarf firmware clears heater target when tool is deselected for safety.
         # For multi-tool printing, we want parked tools to maintain their temps
@@ -7444,51 +7912,172 @@ class PuppyBootloader:
                 break
             self.reactor.pause(self.reactor.monotonic() + 1.0)
 
-    def cmd_M106(self, gcmd):
-        """M106 [T<tool>|P<fan>] S<speed> - Set fan speed (0-255)"""
-        # Accept both T and P for tool/fan selection (T takes precedence)
-        fan = gcmd.get_int('T', gcmd.get_int('P', self.active_tool))
-        speed = gcmd.get_int('S', 255)
-        dwarf = fan + 1
+    # ------------------------------------------------------------------
+    # PRINT FAN
+    #
+    # Ported from stock Prusa Buddy (XL). Three rules, all from source:
+    #
+    #  1. One logical print fan, routed to the active tool.
+    #     hwio_XLBuddy.cpp:398
+    #         case MARLIN_PIN(FAN):
+    #             Fans::print(active_extruder).set_pwm(ulValue);
+    #
+    #  2. Parking a tool zeroes its fan; the incoming tool gets the print
+    #     fan value. toolchanger.cpp:345
+    #         "Disable print fan on old dwarf, fan on new dwarf will be
+    #          enabled by marlin"
+    #         Fans::print(old_dwarf->dwarf_index()).set_pwm(0);
+    #     Marlin re-applies fan_speed[0] through active_extruder on every
+    #     pass, so the pick half is implicit there. Klipper has no such
+    #     loop, so _fan_apply_to_tool() writes it once at pick time.
+    #
+    #  3. Direct per-tool actuation goes through the selftest latch and
+    #     does NOT disturb the print fan value.
+    #     CFanCtl3Wire.cpp:251-310, selftest_tool_offsets.cpp:77-89.
+    #     toolchanger.cpp:494 gives the reason: "use fanctl interface
+    #     directly, without modifing marlin's value. This will prevent
+    #     restoring wrong fan value on power panic or failed toolchange."
+    # ------------------------------------------------------------------
 
+    def _fan_write(self, dwarf, speed):
+        """Write a Dwarf's print fan PWM (0xE002).
+
+        Returns True if a MODBUS write happened, None if there was nothing
+        to do (latched, or already at that speed), False on failure.
+
+        A latched Dwarf ignores the write, exactly as CFanCtl3Wire::set_pwm()
+        returns false while selftest_mode is set.
+        """
         if dwarf not in self.booted_dwarfs:
-            raise gcmd.error(f"Fan {fan} (Dwarf {dwarf}) not available")
-
-        # Clamp to 0-255
-        speed = max(0, min(255, speed))
-
+            return False
+        if dwarf in self.fan_selftest:
+            return None  # latched for direct control - drop the write
+        speed = max(0, min(255, int(speed)))
         # Skip MODBUS write if speed hasn't changed (prevents bus flooding)
-        current_speed = self.fan_speeds.get(dwarf, -1)
-        if speed == current_speed:
-            return  # No change, skip MODBUS write
-
-        # Write to register 0xE002 (fan0_pwm)
+        if self.fan_speeds.get(dwarf, -1) == speed:
+            return None
         if self._write_register(dwarf, 0xE002, speed):
             self.fan_speeds[dwarf] = speed
-            pct = int(speed / 255.0 * 100)
-            self.gcode.respond_info(f"T{fan} fan: {speed}/255 ({pct}%)")
-        else:
-            raise gcmd.error(f"Failed to set fan on Dwarf {dwarf}")
+            return True
+        return False
 
-    def cmd_M107(self, gcmd):
-        """M107 [T<tool>|P<fan>] - Turn fan off"""
-        # Accept both T and P for tool/fan selection (T takes precedence)
-        fan = gcmd.get_int('T', gcmd.get_int('P', self.active_tool))
+    def _fan_selftest_enter(self, dwarf):
+        """Latch a Dwarf's fan for direct control (enter_selftest_mode).
+
+        Records the current PWM so _fan_selftest_exit() can restore it.
+        """
+        if dwarf in self.fan_selftest:
+            return
+        self.fan_selftest[dwarf] = self.fan_speeds.get(dwarf, 0)
+
+    def _fan_selftest_set(self, dwarf, speed):
+        """Set a latched Dwarf's fan PWM (selftest_set_pwm).
+
+        Only works while latched, matching CFanCtl3Wire::selftest_set_pwm().
+        """
+        if dwarf not in self.fan_selftest:
+            return False
+        speed = max(0, min(255, int(speed)))
+        if self._write_register(dwarf, 0xE002, speed):
+            self.fan_speeds[dwarf] = speed
+            return True
+        return False
+
+    def _fan_selftest_exit(self, dwarf):
+        """Release the latch, restoring the pre-latch PWM (exit_selftest_mode)."""
+        if dwarf not in self.fan_selftest:
+            return
+        restore = self.fan_selftest.pop(dwarf)
+        self._fan_write(dwarf, restore)
+
+    def _fan_park_tool(self, dwarf):
+        """Print fan off on the tool being parked. toolchanger.cpp:348."""
+        if dwarf > 0:
+            self._fan_write(dwarf, 0)
+
+    def _fan_apply_to_tool(self, dwarf):
+        """Route the print fan to the tool just picked. toolchanger.cpp:345."""
+        if dwarf > 0:
+            self._fan_write(dwarf, self.print_fan_speed)
+
+    def cmd_M106(self, gcmd):
+        """M106 [T<tool>|P<fan>] S<speed> - Set fan speed (0-255)
+
+        Bare M106 (no T/P) is THE PRINT FAN: it sets the machine-wide print
+        fan speed and applies it to the active tool, matching the XL's
+        analogWrite(FAN) -> Fans::print(active_extruder).set_pwm(). This is
+        the only form a slicer emits.
+
+        M106 T<n>/P<n> addresses one tool directly and does NOT change the
+        print fan speed, so a later toolchange will not carry it around.
+        """
+        # T takes precedence over P; absent both, this is the print fan
+        explicit = gcmd.get_int('T', gcmd.get_int('P', None))
+        # get_FLOAT, not get_int. PrusaSlicer emits fractional fan speeds -
+        # M106 S127.5 is 50% - and get_int raises "unable to parse 127.5",
+        # which ABORTS THE PRINT. Klipper's own fan M106 uses get_float, so
+        # this matches it. OrcaSlicer only ever emitted integers, which is
+        # why this went unnoticed. Observed 2026-09-04 in a PrusaSlicer
+        # 3.0.0-alpha11 file: 217 M106 lines, values S127.5 / S224.4 /
+        # S229.5 / S252.45 / S255.
+        speed = int(round(max(0., min(255., gcmd.get_float('S', 255.)))))
+
+        if explicit is None:
+            self.print_fan_speed = speed
+            if not self.tool_picked or self.active_tool < 0:
+                # NOTHING ON THE CARRIAGE - store the value, write nothing.
+                # Prusa gives "no tool" its own dummy extruder slot,
+                # MARLIN_NO_TOOL_PICKED = EXTRUDERS - 1 (toolchanger_utils.h:18),
+                # so Fans::print(active_extruder) lands on a fan object that
+                # goes nowhere and the write is discarded. Klipper has no such
+                # slot and defaults active_tool to 0 when nothing is picked
+                # ("Default to T0 for MODBUS commands"), so without this guard
+                # a bare M106 spins T0 while the carriage is EMPTY. Observed
+                # exactly that on 2026-09-05. The stored speed is applied by
+                # _fan_apply_to_tool() on the next pick, which is the same
+                # end result Marlin gets from re-applying fan_speed[0].
+                return
+            fan = self.active_tool
+        else:
+            fan = explicit
         dwarf = fan + 1
 
         if dwarf not in self.booted_dwarfs:
             raise gcmd.error(f"Fan {fan} (Dwarf {dwarf}) not available")
 
-        # Skip MODBUS write if fan is already off (prevents bus flooding)
-        current_speed = self.fan_speeds.get(dwarf, -1)
-        if current_speed == 0:
-            return  # Already off, skip MODBUS write
+        result = self._fan_write(dwarf, speed)
+        if result is False:
+            raise gcmd.error(f"Failed to set fan on Dwarf {dwarf}")
+        if result:
+            pct = int(speed / 255.0 * 100)
+            self.gcode.respond_info(f"T{fan} fan: {speed}/255 ({pct}%)")
 
-        if self._write_register(dwarf, 0xE002, 0):
-            self.fan_speeds[dwarf] = 0
-            self.gcode.respond_info(f"T{fan} fan off")
+    def cmd_M107(self, gcmd):
+        """M107 [T<tool>|P<fan>] - Turn fan off
+
+        Bare M107 turns the print fan off (and so the active tool's fan);
+        M107 T<n> turns off one tool's fan without touching the print fan.
+        """
+        explicit = gcmd.get_int('T', gcmd.get_int('P', None))
+
+        if explicit is None:
+            self.print_fan_speed = 0
+            # Same no-tool rule as cmd_M106 above - see the note there.
+            if not self.tool_picked or self.active_tool < 0:
+                return
+            fan = self.active_tool
         else:
+            fan = explicit
+        dwarf = fan + 1
+
+        if dwarf not in self.booted_dwarfs:
+            raise gcmd.error(f"Fan {fan} (Dwarf {dwarf}) not available")
+
+        result = self._fan_write(dwarf, 0)
+        if result is False:
             raise gcmd.error(f"Failed to turn off fan on Dwarf {dwarf}")
+        if result:
+            self.gcode.respond_info(f"T{fan} fan off")
 
     def cmd_M140(self, gcmd):
         """M140 S<temp> - Set bed temperature
@@ -7778,7 +8367,11 @@ class PuppyBootloader:
         lines = [f"Bed area: ({x0:.0f},{y0:.0f})-({x1:.0f},{y1:.0f}), "
                  f"{enabled_count}/16 bedlets enabled"]
         lines.append("  Bedlet grid (* = enabled):")
-        for row in range(4):
+        # Print the BACK row first so this reads the way you look at the
+        # machine: rear (tool docks) at the top, front (LCD) at the bottom.
+        # BEDLET_MAP itself stays in firmware order (row 0 = front, Y 0-90).
+        lines.append("    REAR / TOOL DOCKS")
+        for row in range(3, -1, -1):
             row_str = "    "
             for col in range(4):
                 phys = self.BEDLET_MAP[row][col]
@@ -7787,6 +8380,7 @@ class PuppyBootloader:
             y_lo = row * 90
             y_hi = (row + 1) * 90
             lines.append(f"  Y{y_lo:3d}-{y_hi:3d}: {row_str}")
+        lines.append("    FRONT / LCD")
         self.gcode.respond_info("\n".join(lines))
 
     def cmd_CLEAR_BED_AREA(self, gcmd):
@@ -7850,6 +8444,15 @@ class PuppyBootloader:
             raise gcmd.error("TEMP parameter required")
         if dwarf < 1 or dwarf > 5:
             raise gcmd.error("DWARF must be 1-5")
+        # Every other Dwarf-addressing command in this module guards on
+        # booted_dwarfs; this one did not. Without it, addressing a Dwarf that
+        # isn't on the bus spends ~1s in _write_register retries and then
+        # raises - which is what used to abort END_PRINT part way through on an
+        # XL with fewer than 5 tools. Print-end paths now call
+        # DISABLE_ALL_HOTENDS instead, so this raise only reaches a caller that
+        # explicitly named a tool that isn't there.
+        if dwarf not in self.booted_dwarfs:
+            raise gcmd.error(f"Dwarf {dwarf} (T{dwarf - 1}) not available")
 
         if self._write_register(dwarf, 0xE000, int(temp)):
             # Track target temp so TOOL_PARK knows to turn off heater
@@ -7865,6 +8468,83 @@ class PuppyBootloader:
                 logging.info(f"PuppyBootloader: SET_DWARF_TEMP synced Klipper heater to {temp}C")
         else:
             raise gcmd.error(f"Failed to set Dwarf {dwarf} temperature")
+
+    def cmd_DISABLE_ALL_HOTENDS(self, gcmd):
+        """DISABLE_ALL_HOTENDS - Turn off every booted Dwarf hotend heater.
+
+        The Klipper equivalent of Marlin's Temperature::disable_heaters(),
+        temperature.cpp:2420:
+
+            #if HOTENDS
+              HOTEND_LOOP() setTargetHotend(0, e);
+            #endif
+
+        Stock iterates the hotends that EXIST. This iterates booted_dwarfs for
+        the same reason, and replaces the hardcoded
+
+            SET_DWARF_TEMP DWARF=1 TEMP=0   ... through DWARF=5
+
+        block that END_PRINT and CANCEL_PRINT used to carry. On an XL with
+        fewer than 5 tools the first absent Dwarf raised and ABORTED the rest
+        of the macro - so END_PRINT never reached CLEAR_BED_AREA, `M140 S0`,
+        `M84` or _status_complete, and THE BED STAYED HOT with no error shown
+        to the user. Confirmed 2026-09-02: an error mid-script really does
+        drop every following line.
+
+        Best-effort by design: a shutdown sweep must never abort part way, so
+        a failure on one Dwarf warns and the sweep carries on to the rest.
+        """
+        failed = []
+        done = []
+        for dwarf in sorted(self.booted_dwarfs):
+            if self._write_register(dwarf, 0xE000, 0):
+                # Zero the STORED target too, not just the register. The poll
+                # loop refreshes parked tools from target_temps every ~10
+                # cycles, and TOOL_PARK re-sends it on the way into the dock -
+                # either would put the heat straight back on.
+                self.target_temps[dwarf] = 0
+                if (dwarf - 1) == self.active_tool and self._extruder_heater is not None:
+                    self._extruder_heater.set_temp(0.)
+                done.append(dwarf - 1)
+            else:
+                failed.append(dwarf - 1)
+
+        if done:
+            gcmd.respond_info("Hotends off: T%s"
+                              % ", T".join(str(t) for t in done))
+        if failed:
+            gcmd.respond_info("WARNING: hotend off FAILED on T%s"
+                              % ", T".join(str(t) for t in failed))
+
+    def cmd_M142(self, gcmd):
+        """M142 [S<temp>] [T<tool>] - Set heatbreak cooling target.
+
+        ACCEPTED BUT NOT ACTED ON, and that is not a fudge - read on.
+
+        Stock Prusa (M142.cpp:54) does:
+            if (parser.seenval('S'))
+                thermalManager.setTargetHeatbreak(parser.value_celsius(),
+                                                  target_extruder);
+
+        KlipperXL cannot do the equivalent. The Dwarf regulates its own
+        heatbreak fan and exposes no writable register for the target - the
+        only writable Dwarf registers this module has are 0xE000 (nozzle
+        target) and 0xE002 (print fan). heatbreak_temp is READ-only, polled
+        from regs[6]. The tool-offset cooldown says the same thing at the
+        point it needs it: "the heatbreak fan has no exposed command".
+
+        So this exists purely so PrusaSlicer's start/end gcode stops raising
+        "Unknown command: M142" - the Dwarf was regulating heatbreak cooling
+        by itself before this command existed and still is, so nothing is
+        lost by accepting it. Logged rather than silently swallowed: M302
+        was a no-op stub whose callers assumed it worked, and that cost a
+        night of debugging on 2026-09-01.
+        """
+        temp = gcmd.get_float('S', None)
+        tool = gcmd.get_int('T', self.active_tool)
+        logging.info(
+            f"PuppyBootloader: M142 heatbreak target S={temp} T={tool} - "
+            f"accepted, not settable (Dwarf regulates its own heatbreak fan)")
 
     def cmd_M151(self, gcmd):
         """M151 - Set LED strip color (Prusa XL compatibility stub)
@@ -8001,8 +8681,9 @@ class PuppyBootloader:
         tool_z_adj = 0.0
         tool_offsets_mod = self.printer.lookup_object('tool_offsets', None)
         if tool_offsets_mod is not None:
-            tool_z_adj = tool_offsets_mod.get_z_offset(tool)
-        total_z = -oz + tool_z_adj
+            tool_z_adj = tool_offsets_mod.get_z_offset(
+                tool, single=self._use_single_slot(tool))
+        total_z = -(oz - self._z_datum_cal_z()) + tool_z_adj
         try:
             self.gcode.run_script_from_command(
                 f"SET_GCODE_OFFSET X={-ox:.4f} Y={-oy:.4f} Z={total_z:.4f} MOVE=0")
@@ -8303,7 +8984,10 @@ class PuppyBootloader:
 
     def get_status(self, eventtime):
         """Status for Klipper's object system"""
-        status = {'active_tool': self.active_tool, 'tool_picked': self.tool_picked}
+        status = {'active_tool': self.active_tool,
+                  'tool_picked': self.tool_picked,
+                  'z_home_tool': self.z_home_tool,
+                  'single_tool_mode': self.single_tool_mode}
         for dwarf in self.booted_dwarfs:
             data = self.dwarf_data.get(dwarf, {})
             target = self.target_temps.get(dwarf, 0)

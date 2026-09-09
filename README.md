@@ -23,6 +23,8 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 ### Filament Handling
 - **Filament Autoload** - Insert filament and it automatically loads, heats, purges, and retracts (Prusa-matched sequence)
 - **Filament Sensor Monitoring** - Side and nozzle sensor state tracking per tool via MODBUS polling
+- **Load / Unload Buttons** - `FILAMENT_LOAD` and `FILAMENT_UNLOAD` give Mainsail a button and a parameter form for the Prusa M701 / M702 sequences, which are registered in Python and so are otherwise invisible in the Macros panel
+- **Melt Zone Recovery** - `END_PRINT` empties the hot end with a deep retract, which used to leave the *next* print's first perimeters running dry. The retract is now recorded per tool and given back at the next prime line
 
 ### Bed & Probing
 - **Loadcell Z Probing** - Uses the Dwarf's built-in loadcell for Z homing and bed mesh leveling
@@ -30,6 +32,7 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 - **Modular Bed Control** - 16-zone (4x4 grid) heated bed with individual bedlet temperature control
 - **Adaptive Bed Heating** - Heats only bedlets under the print area with gradient heating on adjacent zones (anti-warp)
 - **Adjustable Probe Thresholds** - Change loadcell sensitivity for Z, mesh, and XY calibration from Mainsail
+- **Single-Tool Z Datum** - A single-tool job homes Z with the nozzle that is actually printing, instead of heating T0, probing with it, and relying on the stored offset to translate. Driven by the `TOOLS` parameter from the slicer; files sliced before this change fall back to the original multi-tool path
 
 ### Motion & Calibration
 - **Automatic Per-Tool Pressure Advance** *(new — requires a firmware re-flash)* - Measures PA for **each tool separately** using that Dwarf's own loadcell as a back-pressure sensor, then applies the right value on every tool change. One button, ~6 minutes, no test prints and no eyeballing corners. Tools are not interchangeable in practice — on a 5-tool XL, the same spool measured 0.0367 / 0.0552 / 0.0647 across T0/T1/T2, a 77% spread — so a single shared PA value is wrong for most of your tools. Analysis by [CNC Kitchen](https://github.com/CNCKitchen/PrusaPATuner). See the [Pressure Advance Guide](docs/PRESSURE_ADVANCE.md)
@@ -42,6 +45,8 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 - **Multi-Tool Heater Preservation** - Parked tools maintain temperature via periodic MODBUS refresh
 - **Independent Tool Heating** - Heat any tool by number (M104 T2 S200) without selecting it
 - **Automatic Heater Sync** - Active tool temperature synced to Klipper's extruder for accurate display
+- **Tool-Count Independent Shutdown** - `DISABLE_ALL_HOTENDS` turns off the tools that actually booted rather than a hardcoded five, so end-of-print works the same on a 1-tool XL as on a 5-tool
+- **Print Fan Follows the Tool** - One logical print fan routed to whichever tool is picked, matching stock. Parking a tool stops its fan instead of leaving it running in the dock
 
 ### Interface & Monitoring
 - **Side LED Strips** - Status effects for idle, printing, heating, paused, error, and complete states
@@ -118,6 +123,10 @@ KlipperXL/
 | `SET_BED_AREA X0= Y0= X1= Y1=` | Set adaptive bed heating zone |
 | `CLEAR_BED_AREA` | Reset to full bed heating |
 | `SET_DWARF_TEMP DWARF= TEMP=` | Set individual tool temperature |
+| `DISABLE_ALL_HOTENDS` | Turn off every booted tool heater (used by END_PRINT / CANCEL_PRINT) |
+| `FILAMENT_LOAD TOOL= TEMP=` | Load filament into a tool (Prusa M701 sequence) |
+| `FILAMENT_UNLOAD TOOL= TEMP=` | Unload filament from a tool (Prusa M702 sequence) |
+| `FILAMENT_SENSORS` | Show filament sensor states and calibration for all tools |
 | `SPOOL_JOIN TO=` | Remap current tool to a different physical tool |
 | `SPOOL_JOIN_STATUS` | Show active spool join remaps |
 | `SHOW_THRESHOLDS` | Show probe threshold settings |

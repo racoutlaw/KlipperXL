@@ -1,3 +1,299 @@
+## 2026-09-08
+
+### FIXED: cancelling a print never emptied the melt zone
+
+- `END_PRINT` pulls `E-20` and records it, so the next print on that tool gets it
+  back. **Cancelling did neither** — it retracted 1 mm and parked. A cancelled
+  print stops and parks exactly like a finished one, so it leaves the same 20 mm
+  of void behind, and the next print on that tool paid for it
+- The mechanism to do it already existed and had **never run**.
+  `_CLIENT_VARIABLE` sets `user_cancel_macro: "_MELT_RETRACT_ON_CANCEL"`, but
+  that hook only fires from **Mainsail's** `CANCEL_PRINT` — and
+  `config/macros/print_macros.cfg` is included *after* `mainsail.cfg` and defines
+  its own `CANCEL_PRINT`, which replaces Mainsail's outright. The hook was never
+  consulted, so the macro behind it was dead code
+- `CANCEL_PRINT` now calls `_MELT_RETRACT_ON_CANCEL` explicitly, **before** the
+  heaters are turned off. The guard inside it checks actual nozzle temperature,
+  and a nozzle below `min_extrude_temp` cannot retract at all — so ordering here
+  is load-bearing
+- The old 1 mm retract is removed. The melt retract already pulls 20 mm and books
+  exactly 20; another 1 mm would put the filament 21 mm back while only 20 was
+  recorded, leaving the next print 1 mm short — the same class of bug the
+  melt-zone recovery exists to fix, just smaller
+
+---
+
+## 2026-09-05
+
+### FIXED: the part cooling fan never turned off on a parked tool
+
+- A tool parked mid-print kept its part cooling fan running for the **rest of the
+  print, and after it**. On a five-tool job that meant four fans blowing into
+  their docks for hours
+- The fan speed lives in each Dwarf's own register (`0xE002`). Nothing on the
+  Klipper side ever cleared it, so once a tool was parked at speed it stayed
+  there until something else happened to address that tool
+- The root cause was that this firmware had five fan registers and **no concept
+  of "the print fan"**. Slicers only ever emit a bare `M106 S<x>` because they
+  assume a single fan — one real five-tool file here contained **699 `M106` and
+  zero `M107`** across 45 toolchanges. A bare `M106` was routed to whichever tool
+  happened to be active, and the value was then stranded on that tool forever
+- Stock Prusa does not work this way. `hwio_XLBuddy.cpp` routes the machine's one
+  fan value to whichever tool is picked:
+
+  ```cpp
+  case MARLIN_PIN(FAN):
+      Fans::print(active_extruder).set_pwm(ulValue);
+  ```
+
+  and `toolchanger.cpp` clears the outgoing tool on every change:
+
+  ```cpp
+  // Disable print fan on old dwarf, fan on new dwarf will be enabled by marlin
+  Fans::print(old_dwarf->dwarf_index()).set_pwm(0);
+  ```
+
+- That model is now ported. There is one print fan speed; parking a tool zeroes
+  its fan, picking a tool applies the stored speed. Marlin re-applies its value
+  continuously through `active_extruder`; Klipper has no such loop, so it is
+  written once at pick time
+- `M106 T<n>` / `P<n>` still addresses one tool directly and deliberately does
+  **not** disturb the print fan value, so a later toolchange will not carry it
+  around. That is Prusa's rule too — `toolchanger.cpp` notes it uses the fanctl
+  interface directly "without modifing marlin's value"
+- Per-tool fans also gained a **selftest latch**, mirroring
+  `CFanCtl3Wire::selftest_mode`: while a tool is latched, ordinary fan writes are
+  ignored and the pre-latch speed is restored on release. This is what lets the
+  tool-offset cooldown run fans on *parked* tools without a toolchange stomping
+  them
+
+### FIXED: END_PRINT left the bed hot on an XL with fewer than five tools
+
+- `END_PRINT` and `CANCEL_PRINT` each carried five hardcoded lines:
+
+  ```
+  SET_DWARF_TEMP DWARF=1 TEMP=0
+  ... through DWARF=5
+  ```
+
+- `cmd_SET_DWARF_TEMP` was the **only** Dwarf-addressing command in the module
+  without a `booted_dwarfs` check — it validated the range 1-5 and then wrote.
+  Every other such command guards on `if dwarf not in self.booted_dwarfs`
+- On a two- or three-tool XL, the first absent Dwarf spent about a second in
+  MODBUS retries, returned `False`, and raised. **A raised error aborts the rest
+  of the macro**, which was confirmed by test: sending `M118 STEP-1` /
+  `SET_DWARF_TEMP DWARF=9` / `M118 STEP-3` echoes `STEP-1`, reports the error,
+  and never prints `STEP-3`
+- So on a partial XL, `END_PRINT` died before reaching `CLEAR_BED_AREA`,
+  `M140 S0`, `M84 X Y E` and `_status_complete`. **The bed stayed at print
+  temperature with nothing on screen to say so.** `CANCEL_PRINT` survived only by
+  luck — its `M140 S0` sits above the Dwarf block
+- Replaced with `DISABLE_ALL_HOTENDS`, which iterates the Dwarfs that actually
+  booted and is best-effort: a failure on one warns and the sweep continues. A
+  shutdown path must never abort part way. This mirrors Marlin's
+  `Temperature::disable_heaters()`, which does `HOTEND_LOOP() setTargetHotend(0, e)`
+  — iterating the hotends that exist, never a hardcoded count
+- `cmd_SET_DWARF_TEMP` also gained the missing `booted_dwarfs` guard
+- **Order note for anyone editing `END_PRINT`:** `CLEAR_BED_AREA` must stay
+  *before* `M140 S0`. `cmd_M140` only resets `bed_global_target` in its
+  "no area set" branch; with an area still set it takes the adaptive branch and
+  leaves the target at e.g. 60, and `CLEAR_BED_AREA` then re-heats all 16
+  bedlets. Swapping them leaves the bed on
+
+### FIXED: M106 could not parse a fractional fan speed, and it killed prints
+
+- `cmd_M106` read its speed with `gcmd.get_int('S', 255)`. PrusaSlicer emits
+  fractional fan speeds — `M106 S127.5` is 50% — and `get_int` raises
+  `unable to parse 127.5`, **which aborts the running print**
+- OrcaSlicer only ever emitted integers, which is why this went unnoticed. One
+  PrusaSlicer file here contained 217 `M106` lines with values `S127.5`,
+  `S224.4`, `S229.5`, `S252.45` and `S255`
+- Now uses `get_float`, clamped and rounded — which is what Klipper's own fan
+  `M106` does
+
+### FIXED: a bare M106 with no tool picked spun T0
+
+- On startup with nothing on the carriage, `active_tool` is set to `0`
+  ("default to T0 for MODBUS commands"), so it is **never negative** in the
+  parked state and the old `if fan < 0: return` guard could never fire. A bare
+  `M106` typed at the console with an empty carriage spun T0's fan
+- Stock gives "no tool" its own dummy extruder slot —
+  `MARLIN_NO_TOOL_PICKED = EXTRUDERS - 1` in `toolchanger_utils.h` — so
+  `Fans::print(active_extruder)` lands on a fan object that discards the write
+- Now the bare form stores the print fan speed and writes nothing while no tool
+  is picked. The stored value is applied on the next pick, which is the same end
+  state Marlin reaches by re-applying `fan_speed[0]` continuously
+
+### ADDED: M142 is accepted instead of erroring
+
+- PrusaSlicer's XL start and end gcode emit `M142 S36` (heatbreak cooling
+  target), which raised `Unknown command` twice per print
+- It is now accepted and logged, and **explicitly documented as not acted on**.
+  The Dwarf regulates its own heatbreak fan and exposes no writable register for
+  it — the only writable Dwarf registers this module has are `0xE000` (nozzle
+  target) and `0xE002` (print fan); `heatbreak_temp` is read-only
+- Deliberately logged rather than silently swallowed. `M302` was a no-op stub
+  whose callers assumed it worked, and that cost a night of debugging
+
+---
+
+## 2026-08-27
+
+### FIXED: the first perimeters of a print ran dry
+
+- `END_PRINT` pulls `E-20` to empty the melt zone while the nozzle is still hot.
+  That is correct and deliberate — but it leaves **20 mm of void** above the
+  nozzle, and nothing gave it back
+- The prime line only returns about **13 mm** at these bead widths (7.48 mm on
+  the fat pass, 5.61 mm on the clean pass). The remaining ~7 mm was paid for by
+  **the part itself**: the first perimeters extruded into void and plastic
+  arrived late
+- The deep retract is now **recorded per tool** in `save_variables`
+  (`melt_retract_t0` … `melt_retract_t4`), and the next `START_PRINT` on that
+  tool gives back exactly what was taken, then clears the flag
+- The refill happens at the start of the prime line with the nozzle lifted, so
+  anything that does emerge lands at the head of the sacrificial purge line
+  rather than on the part, and the fat pass immediately drags away from it
+- Flags are per tool and survive restarts and power-off. They are cleared by that
+  tool's own `START_PRINT` recovery, by `LOAD_FILAMENT`, by `UNLOAD_FILAMENT`, or
+  by autoload — so a second print, a manual load, or a fresh spool never
+  double-charges it
+
+---
+
+## 2026-08-20
+
+### ADDED: single-tool prints home Z with the tool that is actually printing
+
+- Previously every print homed Z on T0 regardless of which tool was printing.
+  For a single-tool job on T3 that meant heating T0, picking it, probing with it,
+  parking it, then picking T3 — and accepting T0's nozzle length as the datum
+- `START_PRINT` now takes a `TOOLS` parameter (how many tools the job uses). When
+  `TOOLS=1`, the printing nozzle establishes Z=0 itself: no T0 heat-and-swap, and
+  no reliance on the stored tool-offset to translate between them
+- When `TOOLS` is absent — any file sliced before this change — it defaults to 0
+  and the multi-tool path runs exactly as before
+- The datum choice reaches `[homing_override]` through a macro variable rather
+  than a `G28` parameter, because **`G28` cannot take `KEY=VALUE`**. It is a
+  standard gcode command, so Klipper parses it with `args_r` and `PROBE_TOOL=3`
+  arrives as the literal string `'=3'`, which `|int` turns into 0. Only extended
+  commands get `KEY=VALUE` handling
+- The variable is one-shot: the override resets it after homing, so any other
+  `G28` — manual, or the internal ones inside `puppy_bootloader.py` — still homes
+  on T0 as it always did
+
+### FIXED: START_PRINT could leave the wrong tool on the bed
+
+- Step 8 used to be `{% if TOOL != 0 %} T{TOOL} {% endif %}` — it assumed homing
+  had left T0 picked
+- A macro template is rendered *before* it runs, so the macro cannot observe
+  which tool homing actually left on the carriage. It can only assume, and
+  assuming is what put T0 on the bed for a T3 job
+- The pick is now unconditional. Picking an already-picked tool short-circuits
+  inside `puppy_bootloader` (it re-applies offsets and returns), so it costs
+  nothing when the assumption would have been right
+
+### CHANGED: homing acceleration now matches stock
+
+- Klipper was homing at the printer's `max_accel`. Stock Prusa uses a dedicated
+  `XY_HOMING_ACCELERATION` of **1250** (`Configuration_XL_adv.h:1340`, under
+  `IMPROVE_HOMING_RELIABILITY`)
+- `[homing_override]` now sets 1250 for the XY homing moves and restores the
+  configured `max_accel` afterwards. `XY_HOMING_JERK 8` already matched
+  `square_corner_velocity: 8`
+
+### ADDED: filament load / unload buttons in Mainsail
+
+- `LOAD_FILAMENT` and `UNLOAD_FILAMENT` are registered in Python and have always
+  worked, but Mainsail and Fluidd only list `[gcode_macro]` sections in their
+  Macros panel — so a Python-registered command is invisible there no matter how
+  well it works
+- New `config/filament_macros.cfg` adds `FILAMENT_LOAD`, `FILAMENT_UNLOAD` and
+  `FILAMENT_SENSORS` as thin wrappers with a parameter form
+- They are deliberately **not** named `LOAD_FILAMENT` / `UNLOAD_FILAMENT`:
+  Klipper refuses to start if a `[gcode_macro]` claims a command name that is
+  already registered, so a same-name wrapper would break the printer at config
+  load
+- `TOOL` defaults to 0 rather than "whatever is picked" — right for a console
+  command, wrong for a button, since clicking it should never load filament into
+  a tool you did not mean
+
+## Upgrading to 2026-09-08 from an earlier version
+
+> ### No firmware rebuild is needed
+>
+> Unlike the 2026-08-16 release, everything here is Python and config. Your
+> XLBuddy firmware is untouched.
+
+### 1. Copy the Python modules
+
+```bash
+cp klippy/puppy_bootloader.py ~/klipper/klippy/extras/
+cp klippy/tool_offsets.py     ~/klipper/klippy/extras/
+```
+
+### 2. Copy the new config file
+
+```bash
+cp config/filament_macros.cfg ~/printer_data/config/
+```
+
+and add the include to your `printer.cfg`, next to the others:
+
+```ini
+[include filament_macros.cfg]
+```
+
+### 3. Merge the macro changes into your own printer.cfg
+
+> ⚠ **Do not copy `config/printer.cfg` over your own.** Yours holds your MCU
+> serial, your measured input shaper and Z offsets, and the `SAVE_CONFIG` block
+> with your bed mesh and per-tool values. Copying the shipped file over it
+> destroys all of that.
+
+Merge these three changes by hand:
+
+- **`END_PRINT` and `CANCEL_PRINT`** — replace the five hardcoded
+  `SET_DWARF_TEMP DWARF=1..5 TEMP=0` lines with a single `DISABLE_ALL_HOTENDS`.
+  In `END_PRINT`, keep `CLEAR_BED_AREA` **before** `M140 S0`
+- **`CANCEL_PRINT` melt retract** — add `_MELT_RETRACT_ON_CANCEL` as the first
+  thing the macro does, above `M104 S0`, and delete the old `G1 E-1 F648`. Both
+  details matter: the retract needs a hot nozzle, and leaving the 1 mm in place
+  pulls more than gets recorded
+- **`START_PRINT` / `END_PRINT` melt-zone recovery** — the `melt_retract_t<n>`
+  save/restore blocks. These need `[save_variables]`, which this config has
+  already shipped for some time
+- **Single-tool Z datum** — the `[gcode_macro _KXL_Z_DATUM]` container, the
+  `PROBE_TOOL` / `SINGLE_MODE` lines in `[homing_override]`, and the `TOOLS`
+  parameter in `START_PRINT`
+
+Diffing the shipped `config/printer.cfg` against yours is the quickest way to
+see them in context.
+
+### 4. Restart Klipper properly
+
+```bash
+sudo systemctl restart klipper
+```
+
+> ⚠ A `RESTART` or `FIRMWARE_RESTART` from the console **does not reload Python
+> modules**. If you only do that, `DISABLE_ALL_HOTENDS` will come back as an
+> unknown command and `END_PRINT` will fail. It has to be the service restart.
+
+### 5. If your slicer should use the single-tool Z datum
+
+Add `TOOLS=` to your start gcode so `START_PRINT` knows how many tools the job
+uses. In OrcaSlicer:
+
+```
+TOOLS={(is_extruder_used[0]?1:0)+(is_extruder_used[1]?1:0)+(is_extruder_used[2]?1:0)+(is_extruder_used[3]?1:0)+(is_extruder_used[4]?1:0)}
+```
+
+Leaving it out is safe — `TOOLS` defaults to 0 and the original multi-tool
+homing path runs, exactly as before.
+
+---
+
 ## 2026-08-16
 
 ### FIXED: prime line massively over-extruded, causing skipped steps

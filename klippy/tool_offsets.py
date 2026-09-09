@@ -34,8 +34,25 @@ class ToolOffsets:
         self.z_min = config.getfloat('z_min', -0.3)
         self.z_max = config.getfloat('z_max', 0.5)
 
-        # Load per-tool z_offsets from config
+        # Load per-tool z_offsets from config.
+        #
+        # TWO SLOTS PER TOOL, because a squish value is only valid in the frame
+        # it was measured in:
+        #   tN_z_offset         multi-tool prints - Z=0 came from T0's nozzle,
+        #                       so cal_z is applied on top of this
+        #   tN_z_offset_single  single-tool prints - the tool homed itself, so
+        #                       cal_z cancels out and is NOT applied
+        # Any error in cal_z was absorbed into the multi-tool value (the two
+        # always applied together). Remove cal_z and that error stops
+        # cancelling, so the single-tool frame needs its own number.
+        #
+        # The single value DEFAULTS to the multi value, so the first single-tool
+        # print starts from today's known-good figure rather than from zero.
+        # Once they diverge, the difference is a direct measurement of the
+        # cal_z error for that tool.
         self.z_offsets = {}
+        self.z_offsets_single = {}
+        self.single_explicit = {}
         for tool in range(5):
             key = 't%d_z_offset' % tool
             val = config.getfloat(key, 0.)
@@ -47,6 +64,22 @@ class ToolOffsets:
                                                     self.z_min, self.z_max))
                 val = max(self.z_min, min(self.z_max, val))
             self.z_offsets[tool] = val
+
+            skey = 't%d_z_offset_single' % tool
+            sval = config.getfloat(skey, None)
+            if sval is None:
+                # Never tuned in the single-tool frame - inherit the multi value
+                self.z_offsets_single[tool] = val
+                self.single_explicit[tool] = False
+            else:
+                if sval < self.z_min or sval > self.z_max:
+                    logging.warning(
+                        "tool_offsets: T%d z_offset_single %.4f out of bounds "
+                        "(%.1f to %.1f) - clamping" % (tool, sval,
+                                                        self.z_min, self.z_max))
+                    sval = max(self.z_min, min(self.z_max, sval))
+                self.z_offsets_single[tool] = sval
+                self.single_explicit[tool] = True
 
         # Register G-code commands
         self.gcode.register_command(
@@ -84,21 +117,44 @@ class ToolOffsets:
         logging.info("tool_offsets: Overrode Z_OFFSET_APPLY_ENDSTOP "
                      "with per-tool save")
 
-    def get_z_offset(self, tool):
-        """Get the per-tool z_offset for a given tool number."""
-        return self.z_offsets.get(tool, 0.)
+    def get_z_offset(self, tool, single=False):
+        """Get the per-tool z_offset for a given tool number.
+
+        single=True selects the single-tool-print slot, used when that tool
+        established Z=0 itself and cal_z is therefore not applied.
+        """
+        if not single:
+            return self.z_offsets.get(tool, 0.)
+        if self.single_explicit.get(tool, False):
+            return self.z_offsets_single.get(tool, 0.)
+        # Never tuned in this frame - seed from the NET offset the multi-tool
+        # frame applies, which is (-cal_z + squish), NOT the squish alone.
+        #
+        # MEASURED on a 5-tool XL 2026-08-20: cal_z(T3) was stored as 0.3848
+        # while T3's nozzle is only 0.050 longer than T0's. The squish of
+        # -0.300 existed almost entirely to cancel that bad cal_z; together
+        # they gave the correct 0.0848. Single-tool homing correctly drops
+        # cal_z, so inheriting the squish alone leaves -0.300 with nothing to
+        # cancel and drives the nozzle into the bed.
+        puppy = self.printer.lookup_object('puppy_bootloader', None)
+        cal_z = 0.
+        if puppy is not None:
+            cal_z = puppy.tool_offsets.get(tool, (0., 0., 0.))[2]
+        return -cal_z + self.z_offsets.get(tool, 0.)
 
     def get_status(self, eventtime=None):
         """Status for Jinja2 templates and Moonraker."""
-        return {
-            't0_z_offset': self.z_offsets.get(0, 0.),
-            't1_z_offset': self.z_offsets.get(1, 0.),
-            't2_z_offset': self.z_offsets.get(2, 0.),
-            't3_z_offset': self.z_offsets.get(3, 0.),
-            't4_z_offset': self.z_offsets.get(4, 0.),
+        status = {
             'z_min': self.z_min,
             'z_max': self.z_max,
         }
+        for tool in range(5):
+            status['t%d_z_offset' % tool] = self.z_offsets.get(tool, 0.)
+            status['t%d_z_offset_single' % tool] = \
+                self.get_z_offset(tool, single=True)
+            status['t%d_single_tuned' % tool] = self.single_explicit.get(
+                tool, False)
+        return status
 
     def _get_active_tool_and_cal_offset(self):
         """Get active tool number and its calibrated Z offset from puppy_bootloader."""
@@ -111,6 +167,41 @@ class ToolOffsets:
         cal_offset = puppy.tool_offsets.get(tool, (0., 0., 0.))
         return tool, cal_offset[2]  # Return tool number and stored cal Z
 
+    def _get_datum_and_mode(self, tool=None):
+        """Return (cal_z of the tool that set Z=0, use_single_slot).
+
+        The applied offset is -(cal_z - datum_cal_z) + squish, so recovering
+        the squish from a live gcode offset needs the datum term too.
+        Homing on T0 gives datum_cal_z = 0 and this reduces to the old maths.
+        """
+        puppy = self.printer.lookup_object('puppy_bootloader', None)
+        if puppy is None:
+            return 0., False
+        datum_tool = getattr(puppy, 'z_home_tool', 0)
+        datum_cal_z = puppy.tool_offsets.get(datum_tool, (0., 0., 0.))[2]
+        if tool is None:
+            single = bool(getattr(puppy, 'single_tool_mode', False))
+        else:
+            # Same rule the offset application uses: single-tool job AND this
+            # tool is the datum tool.
+            single = bool(puppy._use_single_slot(tool))
+        return datum_cal_z, single
+
+    def _store(self, tool, value, single):
+        """Write a squish value into the correct slot and stage SAVE_CONFIG."""
+        configfile = self.printer.lookup_object('configfile')
+        if single:
+            self.z_offsets_single[tool] = value
+            self.single_explicit[tool] = True
+            key = 't%d_z_offset_single' % tool
+        else:
+            self.z_offsets[tool] = value
+            key = 't%d_z_offset' % tool
+            # No need to touch the single slot: while untuned it is derived
+            # live in get_z_offset(), so it follows this automatically.
+        configfile.set(self.name, key, "%.4f" % value)
+        return key
+
     def cmd_Z_OFFSET_APPLY_PROBE(self, gcmd):
         """Called by Mainsail's Save button.
 
@@ -122,15 +213,16 @@ class ToolOffsets:
         if tool < 0:
             gcmd.respond_info("No tool active - cannot save Z offset")
             return
+        datum_cal_z, single = self._get_datum_and_mode(tool)
 
         # Read total Z gcode offset from Klipper
         gcode_move = self.printer.lookup_object("gcode_move")
         total_z = gcode_move.homing_position[2]
 
-        # The total gcode Z offset = (-cal_z) + per_tool_z + user_adjustment
-        # We want to capture the NEW per_tool_z (which includes user adjustment)
-        # new_per_tool_z = total_z - (-cal_z) = total_z + cal_z
-        new_z_offset = total_z + cal_z
+        # Applied offset = -(cal_z - datum_cal_z) + per_tool_z + user_adjustment
+        # so   new_per_tool_z = total_z + (cal_z - datum_cal_z)
+        # Homing on T0 makes datum_cal_z 0 and this is the original formula.
+        new_z_offset = total_z + (cal_z - datum_cal_z)
 
         # Safety clamp
         if new_z_offset < self.z_min:
@@ -144,25 +236,23 @@ class ToolOffsets:
                 % (tool, new_z_offset, self.z_max))
             new_z_offset = self.z_max
 
-        old_z_offset = self.z_offsets.get(tool, 0.)
-        self.z_offsets[tool] = new_z_offset
-
-        # Stage for SAVE_CONFIG
-        configfile = self.printer.lookup_object('configfile')
-        key = 't%d_z_offset' % tool
-        configfile.set(self.name, key, "%.4f" % new_z_offset)
+        old_z_offset = self.get_z_offset(tool, single=single)
+        key = self._store(tool, new_z_offset, single)
 
         gcmd.respond_info(
-            "T%d z_offset: %.4f (was %.4f)\n"
+            "T%d %s: %.4f (was %.4f)\n"
             "The SAVE_CONFIG command will update the printer config file\n"
             "and restart the printer."
-            % (tool, new_z_offset, old_z_offset))
+            % (tool, key, new_z_offset, old_z_offset))
 
     def cmd_SAVE_TOOL_Z_OFFSET(self, gcmd):
         """Save Z offset for a specific tool (or active tool).
 
-        Usage: SAVE_TOOL_Z_OFFSET [TOOL=0] [Z=0.035]
+        Usage: SAVE_TOOL_Z_OFFSET [TOOL=0] [Z=0.035] [SINGLE=0|1]
         If Z is omitted, captures current adjustment like Z_OFFSET_APPLY_PROBE.
+        SINGLE selects which slot to write; it defaults to the mode the printer
+        is actually in, so a babystep saved during a single-tool print lands in
+        the single-tool slot without the user having to think about it.
         """
         tool = gcmd.get_int('TOOL', -1)
         if tool < 0:
@@ -172,13 +262,14 @@ class ToolOffsets:
                 gcmd.respond_info("No tool active and no TOOL= specified")
                 return
         else:
-            _, cal_z_tuple = self.printer.lookup_object(
-                'puppy_bootloader', None), None
             puppy = self.printer.lookup_object('puppy_bootloader', None)
             if puppy:
                 cal_z = puppy.tool_offsets.get(tool, (0., 0., 0.))[2]
             else:
                 cal_z = 0.
+
+        datum_cal_z, mode_single = self._get_datum_and_mode(tool)
+        single = bool(gcmd.get_int('SINGLE', 1 if mode_single else 0))
 
         z_val = gcmd.get_float('Z', None)
         if z_val is not None:
@@ -187,42 +278,56 @@ class ToolOffsets:
             # Capture from current gcode offset
             gcode_move = self.printer.lookup_object("gcode_move")
             total_z = gcode_move.homing_position[2]
-            new_z_offset = total_z + cal_z
+            new_z_offset = total_z + (cal_z - datum_cal_z)
 
         # Clamp
         new_z_offset = max(self.z_min, min(self.z_max, new_z_offset))
 
-        old_z_offset = self.z_offsets.get(tool, 0.)
-        self.z_offsets[tool] = new_z_offset
-
-        configfile = self.printer.lookup_object('configfile')
-        key = 't%d_z_offset' % tool
-        configfile.set(self.name, key, "%.4f" % new_z_offset)
+        old_z_offset = self.get_z_offset(tool, single=single)
+        key = self._store(tool, new_z_offset, single)
 
         gcmd.respond_info(
-            "T%d z_offset: %.4f (was %.4f)\n"
+            "T%d %s: %.4f (was %.4f)\n"
             "Run SAVE_CONFIG to persist."
-            % (tool, new_z_offset, old_z_offset))
+            % (tool, key, new_z_offset, old_z_offset))
 
     def cmd_SET_TOOL_Z_OFFSET(self, gcmd):
         """Set Z offset for a tool without staging for SAVE_CONFIG.
 
-        Usage: SET_TOOL_Z_OFFSET TOOL=0 Z=0.035
+        Usage: SET_TOOL_Z_OFFSET TOOL=0 Z=0.035 [SINGLE=0|1]
         Updates in memory only. Use SAVE_TOOL_Z_OFFSET to persist.
         """
         tool = gcmd.get_int('TOOL')
         z_val = gcmd.get_float('Z')
         z_val = max(self.z_min, min(self.z_max, z_val))
-        old = self.z_offsets.get(tool, 0.)
-        self.z_offsets[tool] = z_val
-        gcmd.respond_info("T%d z_offset: %.4f (was %.4f)" % (tool, z_val, old))
+        _, mode_single = self._get_datum_and_mode(tool)
+        single = bool(gcmd.get_int('SINGLE', 1 if mode_single else 0))
+        old = self.get_z_offset(tool, single=single)
+        if single:
+            self.z_offsets_single[tool] = z_val
+            self.single_explicit[tool] = True
+            label = 'z_offset_single'
+        else:
+            self.z_offsets[tool] = z_val
+            label = 'z_offset'
+        gcmd.respond_info("T%d %s: %.4f (was %.4f)"
+                          % (tool, label, z_val, old))
 
     def cmd_GET_TOOL_Z_OFFSETS(self, gcmd):
-        """Display all per-tool Z offsets."""
-        lines = ["Per-tool Z offsets:"]
+        """Display all per-tool Z offsets, both frames."""
+        datum_cal_z, mode_single = self._get_datum_and_mode()
+        lines = ["Per-tool Z offsets      multi    single",
+                 "                     (T0 datum) (self-homed)"]
         for tool in range(5):
-            z = self.z_offsets.get(tool, 0.)
-            lines.append("  T%d: %.4f mm" % (tool, z))
+            multi = self.z_offsets.get(tool, 0.)
+            sing = self.get_z_offset(tool, single=True)
+            mark = '' if self.single_explicit.get(tool, False) \
+                else '  (inherited = -cal_z + squish)'
+            lines.append("  T%d:            %8.4f  %8.4f%s"
+                         % (tool, multi, sing, mark))
+        lines.append("")
+        lines.append("Active mode: %s"
+                     % ("SINGLE-TOOL" if mode_single else "MULTI-TOOL"))
         gcmd.respond_info('\n'.join(lines))
 
 
