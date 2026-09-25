@@ -279,6 +279,66 @@ These values have been tuned on a 5-tool Prusa XL:
 | [Bed Mesh](docs/reference/bed_mesh.md) | Mesh algorithm, adaptive probing |
 | [Recovery](firmware/recovery/RECOVERY_INSTRUCTIONS.md) | DFU recovery for bricked XLBuddy |
 
+## Mid-Print Safety Guards
+
+Calibration and test routines refuse to run while a print is in progress. Pressing one
+from Mainsail or the display during a job now returns an error instead of starting.
+
+This matters because several of them home or probe. `PA_TUNE` homes Z **before** picking
+the tool - `homing_override` couples T0 for the loadcell probe - so mid-print it drives
+to bed centre and probes down onto the part, re-datuming Z off the top of the print. The
+job then carries on at a completely wrong Z. `LOADCELL_TEST` is a bare passthrough to
+`LOADCELL_PROBE`, which with no arguments probes straight down from wherever the nozzle
+is standing.
+
+Guarded commands:
+
+| Command | Why it is dangerous mid-print |
+|---|---|
+| `CALIBRATE_PA`, `CALIBRATE_PA_FINE` | homes Z, picks a tool, heats and extrudes |
+| `PA_TUNE_T0`..`PA_TUNE_T4` | wrappers around the above |
+| `CALIBRATE_INPUT_SHAPER` | homes, then shakes the gantry |
+| `TEST_RESONANCES_X` / `_Y` | homes, then shakes the gantry |
+| `CALIBRATE_TOOLS` | tool offset calibration - homes and probes |
+| `DOCK_CAL` | dock calibration - moves into the dock row |
+| `LOADCELL_TEST` | probes straight down from the current position |
+| `PRUSA_Z_LEVEL`, `STALLGUARD_Z_ALIGN` | rams Z into the endstops |
+| `PARK_TOOL` | ejects the toolhead you are printing with |
+
+`paused` is refused as well as `printing` - pausing does not take the part off the bed.
+
+### If you add your own macros
+
+Call `_ASSERT_NOT_PRINTING WHAT=<YOUR_MACRO>` as the **first line** of anything that
+homes, probes, calibrates or swaps tools:
+
+```
+[gcode_macro MY_CALIBRATION]
+gcode:
+    _ASSERT_NOT_PRINTING WHAT=MY_CALIBRATION
+    ...
+```
+
+Two rules worth copying:
+
+- **Guard the command, not the button.** Guarding only the menu wrapper leaves the
+  underlying command reachable, and one direct call walks straight past it
+- **Do not guard things a print legitimately needs.** `START_PRINT` homes *and* probes
+  while `print_stats` already reads `printing`, and `BED_MESH_CALIBRATE` calls the
+  loadcell probe during it. `START_PRINT`, `END_PRINT`, `CANCEL_PRINT`, `PAUSE`,
+  `RESUME` and the Mainsail/timelapse client macros are deliberately unguarded
+
+### Fan faults no longer cancel a print
+
+A failed MODBUS write to a Dwarf print fan used to raise, which aborts the running job.
+Stock Prusa cannot do this - `hwio_XLBuddy.cpp` discards the return value of
+`Fans::print(active_extruder).set_pwm()`, as does every caller of
+`CFanCtl3Wire::set_pwm()`.
+
+A bare `M106` - the only form a slicer emits - now warns and keeps printing. An explicit
+`M106 T<n>` still raises, because a wrong tool number there is an authoring error worth
+seeing. Warnings are edge-triggered: one line when the bus fails, one when it recovers.
+
 ## Safety Notes
 
 - **Z+ = bed DOWN (safe), Z- = bed UP (crash risk)**
@@ -286,6 +346,7 @@ These values have been tuned on a 5-tool Prusa XL:
 - **Breaking the XLBuddy appendix is permanent and cannot be undone.** It is required to flash unsigned firmware. Everything else about KlipperXL is reversible — stock Prusa firmware flashes back and the printer returns to normal — but this does not
 - **Normal flashing is from a USB drive** using Prusa's own bootloader — no jumper, no opening the printer. Build at offset `0x08020200` so the bootloader is preserved
 - **DFU is an advanced recovery method only.** It requires opening the printer and installing the **BOOT0 jumper** on the XLBuddy, and it flashes at `0x08000000` — which overwrites the Prusa bootloader, so USB `.bbf` flashing stops working until you put the bootloader back. That is recoverable: see [Section 12.5](docs/INSTALLATION_GUIDE.md#125-restoring-the-prusa-bootloader), which reflashes `firmware/recovery/bootloader-xl-2.5.0.bin`. Use DFU only if you have no working bootloader or no broken appendix seal
+- **Calibration and test macros refuse to run mid-print.** See [Mid-Print Safety Guards](#mid-print-safety-guards). If you add your own, call `_ASSERT_NOT_PRINTING WHAT=<NAME>` first
 - Dwarfs run stock Prusa firmware - do not modify them
 - Prusa XL hardware acceleration limit is 7000 mm/s² - never exceed this
 - Modular bed has a 120C maximum target temperature enforced in software

@@ -1,3 +1,76 @@
+## 2026-09-24
+
+### FIXED: buttons on the display could wreck a running print
+
+Touching `PA TUNE`, `LOADCELL TEST` and several other controls **while a print was
+running** started the routine immediately. Nothing checked whether the machine was busy.
+
+The worst case, hit on a real machine: `PA_TUNE` **homes Z before picking the tool**
+(`homing_override` couples T0 for the loadcell probe). Mid-print that drives to bed
+centre and probes down **onto the part**, re-datuming Z off the top of the print. The
+job then resumes from the correct gcode position at a completely wrong Z and extrudes
+into thin air. It cost an 88-minute print.
+
+`LOADCELL_TEST` fails differently and just as badly: it is a bare passthrough to
+`LOADCELL_PROBE`, which with no arguments probes straight down from wherever the nozzle
+happens to be. Mid-print that is a 255 C nozzle driven into the part - or past it, into
+the sheet.
+
+- Added a shared `_ASSERT_NOT_PRINTING` macro in `config/printer.cfg`, called as the
+  **first line** of every macro that homes, probes, calibrates or swaps tools:
+  `CALIBRATE_PA`, `CALIBRATE_PA_FINE`, `CALIBRATE_INPUT_SHAPER`, `CALIBRATE_TOOLS`,
+  `TEST_RESONANCES_X`, `TEST_RESONANCES_Y`, `LOADCELL_TEST`, `DOCK_CAL`, `PRUSA_Z_LEVEL`,
+  `PARK_TOOL`, `STALLGUARD_Z_ALIGN`
+- `paused` is refused as well as `printing`. Pausing does not take the part off the bed
+- `_PA_TUNE_RUN` also carries its own guard with a message naming the Z-probe hazard
+
+**Guard the command, not the button.** The first attempt guarded only `_PA_TUNE_RUN`,
+the wrapper behind the `PA TUNE` buttons. `CALIBRATE_PA` is reachable on its own, and
+one click ran straight past the guard and started a sweep on a live print. The refusal
+now sits on the command that does the damage, so every caller inherits it.
+
+**What is deliberately NOT guarded**, because these must move during a print and
+guarding them breaks every job: `START_PRINT`, `END_PRINT`, `CANCEL_PRINT`, `PAUSE`,
+`RESUME`, `_MELT_RETRACT_ON_CANCEL`, `_PARK_IF_TOOL_PICKED`, `_TOOLHEAD_PARK_PAUSE_CANCEL`,
+`_CLIENT_EXTRUDE`, `_CLIENT_LINEAR_MOVE` and the timelapse macros. `START_PRINT` in
+particular homes **and** probes while `print_stats` already reads `printing`.
+
+The guard is also **not** in `loadcell_probe.py`. `BED_MESH_CALIBRATE` legitimately
+calls the probe during `START_PRINT`, so a module-level refusal would break meshing on
+every print. The user-facing macro is the correct level: the primitive has a valid
+mid-print job, the button does not.
+
+Naming is not a reliable filter, either. Eight of the eleven carry `TEST` or `CALIBRATE`
+in the name - but `PARK_TOOL`, `PRUSA_Z_LEVEL` and `DOCK_CAL` do not, and `PARK_TOOL` is
+a single innocuous-looking button that ejects the toolhead you are printing with.
+
+### FIXED: a fan problem could cancel the print
+
+`cmd_M106` raised on a failed MODBUS fan write, and a raise aborts the running job.
+Seen live: the MCU repeated one MODBUS response nine times over four seconds, the query
+returned `None`, and the print died with `buffer_time` already drained to zero.
+
+Stock Prusa structurally cannot do this. `hwio_XLBuddy.cpp:398` calls
+`Fans::print(active_extruder).set_pwm(ulValue)` and throws the returned bool away, as
+does every other caller of `CFanCtl3Wire::set_pwm()`. No stock path lets a fan write
+cancel a job.
+
+There were **two** raises in that path, not one - the `dwarf not in booted_dwarfs` check
+killed a print just as dead if a Dwarf dropped off the bus. Both are handled:
+
+- **bare `M106`** - the only form a slicer emits, so the only one that can appear
+  mid-print - warns and returns. The print continues
+- **explicit `M106 T<n>` / `P<n>`** still raises. That form is hand- or macro-written,
+  so a bad tool number is an authoring error worth surfacing, not swallowing
+- warnings are **edge-triggered** via the new `_fan_warn_once()`: one line when it
+  fails, one `fan write recovered` when it comes back, silence in between. PrusaSlicer
+  emits 200+ `M106` per print, so warning on every failure would flood the console over
+  the same RS485 bus that is already struggling
+
+A missed fan update costs cooling on one layer. Killing the job costs the whole part.
+
+---
+
 ## 2026-09-08
 
 ### FIXED: cancelling a print never emptied the melt zone

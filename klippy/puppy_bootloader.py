@@ -1991,6 +1991,9 @@ class PuppyBootloader:
         # stomping them (CFanCtl3Wire.cpp:251 - set_pwm() returns false in
         # selftest_mode).
         self.fan_selftest = {}  # {dwarf_num: pwm to restore on exit}
+        # {dwarf_num: True while its last fan write failed} - edge-trigger
+        # for _fan_warn_once() so a bus fault warns once, not 217 times.
+        self.fan_write_failed = {}
         self.tmc_enabled = {}  # {dwarf_num: True/False}
         self.tool_picked = False  # True if a tool is on the carriage
         # Tool whose nozzle established Z=0 at the last Z home. Applied tool
@@ -8042,15 +8045,61 @@ class PuppyBootloader:
             fan = explicit
         dwarf = fan + 1
 
+        # A FAN PROBLEM MUST NEVER ABORT A PRINT.
+        #
+        # Stock Prusa structurally cannot do it: hwio_XLBuddy.cpp:398 calls
+        # Fans::print(active_extruder).set_pwm(ulValue) and throws the returned
+        # bool away, exactly as every other caller of CFanCtl3Wire::set_pwm()
+        # does. There is no path in stock firmware where a fan write cancels a
+        # job. Raising here cancelled a real print on 2026-09-05 when the RS485
+        # bus hiccuped - the MCU repeated one MODBUS response nine times over
+        # four seconds, the query returned None, and the job died with
+        # buffer_time already drained to 0.
+        #
+        # A missed fan update costs cooling on one layer. Killing the job costs
+        # the whole part. Warn and carry on.
+        #
+        # THE EXPLICIT FORM STILL RAISES. M106 T<n>/P<n> is someone addressing a
+        # specific fan by hand or from a macro; a bad tool number there is an
+        # authoring error and swallowing it would hide a broken config. Only the
+        # bare M106 - the sole form a slicer emits, and therefore the only one
+        # that can appear mid-print - is made non-fatal.
         if dwarf not in self.booted_dwarfs:
+            if explicit is None:
+                self._fan_warn_once(
+                    dwarf, f"T{fan} fan unavailable (Dwarf {dwarf} not booted)")
+                return
             raise gcmd.error(f"Fan {fan} (Dwarf {dwarf}) not available")
 
         result = self._fan_write(dwarf, speed)
         if result is False:
+            if explicit is None:
+                self._fan_warn_once(
+                    dwarf, f"T{fan} fan write failed (Dwarf {dwarf})")
+                return
             raise gcmd.error(f"Failed to set fan on Dwarf {dwarf}")
+
+        # Bus is answering again for this Dwarf - say so once, then go quiet.
+        if self.fan_write_failed.get(dwarf):
+            self.fan_write_failed[dwarf] = False
+            self.gcode.respond_info(f"T{fan} fan write recovered")
+
         if result:
             pct = int(speed / 255.0 * 100)
             self.gcode.respond_info(f"T{fan} fan: {speed}/255 ({pct}%)")
+
+    def _fan_warn_once(self, dwarf, msg):
+        """Warn on the FAILING EDGE only, never on every write.
+
+        PrusaSlicer emits hundreds of M106 lines per print (217 in one observed
+        file). Warning on each failure would flood the console during exactly
+        the bus fault that caused it, and console traffic on a shared RS485 bus
+        makes a struggling bus worse. One line when it breaks, one when it comes
+        back, silence in between.
+        """
+        if not self.fan_write_failed.get(dwarf):
+            self.fan_write_failed[dwarf] = True
+            self.gcode.respond_info(f"!! {msg} - print continues")
 
     def cmd_M107(self, gcmd):
         """M107 [T<tool>|P<fan>] - Turn fan off
