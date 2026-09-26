@@ -104,7 +104,7 @@ KlipperXL/
   src/                       XLBuddy MCU firmware source (MODBUS)
   firmware/                  Build config & recovery files
   orcaslicer/                Slicer profile and configuration guide
-  scripts/                   Installation & fix scripts
+  scripts/                   Install, firmware build helper, and fix scripts
   pa_analysis/               Pressure Advance analyser (separate venv, see its README)
 ```
 
@@ -143,6 +143,7 @@ KlipperXL/
 | `SAVE_TOOL_PA TOOL= K=` | Save a tool's Pressure Advance to config |
 | `CALIBRATE_PA TOOL= TEMP=` | Run a PA sweep only (no analysis, no save) |
 | `ANALYZE_PA TOOL= SAVE=1` | Analyse the last PA recording |
+| `NOZZLE_LEDS STATE= [TOOL=]` | Nozzle lights: `ON` (follow the picked tool), `OFF`, `ALWAYS` |
 
 ## Per-Tool Z Offset
 
@@ -279,6 +280,69 @@ These values have been tuned on a 5-tool Prusa XL:
 | [Bed Mesh](docs/reference/bed_mesh.md) | Mesh algorithm, adaptive probing |
 | [Recovery](firmware/recovery/RECOVERY_INSTRUCTIONS.md) | DFU recovery for bricked XLBuddy |
 
+## Building the Firmware
+
+**Always build with the helper, never a bare `make`:**
+
+```bash
+bash ~/KlipperXL/scripts/build_klipperxl.sh clean
+bash ~/KlipperXL/scripts/build_klipperxl.sh -j4
+```
+
+> ⚠️ **A plain `make -j4` will build, succeed, and produce firmware with no MODBUS
+> support** — it flashes fine and then cannot talk to any Dwarf.
+
+**Why there is a helper at all.** KlipperXL adds two C files to Klipper's MCU build, and
+Klipper has no hook for out-of-tree sources. The only way in is one added line in each of
+two files that belong to Klipper:
+
+```
+src/stm32/Makefile   src-$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c
+src/Makefile         src-$(CONFIG_WANT_NEOPIXEL) += neopixel_spi.c
+```
+
+Earlier versions left those edits in place permanently, which broke every future Klipper
+update — `git pull` compares real file content and refuses to overwrite local changes.
+Marking them `assume-unchanged` only hid them from `git status`; the update still failed,
+and Moonraker's fallback (`git reset --hard`) would have deleted the MODBUS line silently.
+
+So the helper adds the two lines, builds, and **puts the files back** — including if the
+build fails or you interrupt it. Between builds the repo is clean, and Klipper updates
+apply normally. It then checks `out/src/modbus_stm32f4.o` really was produced before
+reporting success.
+
+**Your own files are never involved.** Every KlipperXL module is a file git has never
+tracked, so `git pull` walks past them and even `git reset --hard` leaves them alone.
+Only those two Klipper-owned Makefiles were ever the issue.
+
+**Upgrading from an older KlipperXL:** run `bash ~/KlipperXL/scripts/fix_klipper_dirty.sh`
+once. It clears the old flags and restores both Makefiles.
+
+## Nozzle Lights
+
+Each Dwarf has a "cheese" LED lighting its nozzle. By default they follow the active
+tool — lit when picked, dark when docked.
+
+```
+NOZZLE_LEDS [STATE=ON|OFF|ALWAYS] [TOOL=<n>]
+```
+
+| STATE | Effect |
+|---|---|
+| `ON` | lit when picked, dark when docked (default) |
+| `OFF` | dark always |
+| `ALWAYS` | lit always, even parked in the dock |
+
+No `TOOL` applies it to every booted Dwarf — correct on an XL with fewer than five
+tools — and the setting is remembered, so a Dwarf that boots later inherits it.
+
+Each Dwarf holds **one** register (`0xE004`) packing **two** brightnesses as
+`(selected_pwm << 8) | not_selected_pwm`, and switches between them itself off its
+`is_selected` coil. So this sets a *policy*, not a state — the tool does its own
+switching. Not persistent: a Klipper restart restores `ON`.
+
+`config/light_macros.cfg` ships `NOZZLE_LIGHTS_ON` / `_OFF` / `_ALWAYS` as button
+wrappers, since Mainsail only draws buttons for `[gcode_macro]` sections.
 ## Mid-Print Safety Guards
 
 Calibration and test routines refuse to run while a print is in progress. Pressing one

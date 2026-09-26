@@ -1,3 +1,117 @@
+## 2026-09-26
+
+### FIXED: Klipper updates always failed, and the reason was hidden on purpose
+
+Every KlipperXL install reached a state where Moonraker could never update Klipper.
+Clicking update produced this, on repeat, then gave up:
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        src/Makefile
+Aborting.  Updating ac2a7f8b..ce7002be
+Error updating klipper: Git Command 'pull --progress' failed
+```
+
+**Why it happened.** KlipperXL adds two C files to Klipper's MCU build, and Klipper
+has no hook for out-of-tree sources. The only way in is to add one line each to two
+files that belong to Klipper:
+
+```
+src/stm32/Makefile   src-$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c
+src/Makefile         src-$(CONFIG_WANT_NEOPIXEL) += neopixel_spi.c
+```
+
+The installer made those edits **permanently**. `git pull` compares real file content,
+so from then on every Klipper update refused to apply.
+
+**Why nobody could see it.** `fix_klipper_dirty.sh` marked both files
+`assume-unchanged`, which tells git to stop checking them. That silenced the symptom
+and left the cause: `git status` said clean, `git diff` showed nothing, and Moonraker
+reported `is_dirty: False, is_valid: True, warnings: []` — while the files really were
+modified the whole time. `git merge` ignores that flag and reads the bytes, so the
+update still failed. The only place the truth ever surfaced was the error above.
+
+**Why it was worse than a failed update.** When a pull fails this way Moonraker treats
+the repo as diverged and falls back to `git reset --hard`, which does *not* honour
+`assume-unchanged` either. That would silently delete the MODBUS build line. The next
+firmware build would then succeed, flash fine, and produce a board unable to talk to
+any Dwarf — with nothing in any log explaining why.
+
+**The fix: stop editing those files at rest.** New `scripts/build_klipperxl.sh` adds
+the two lines, builds, and puts the files back — including when the build fails or is
+interrupted (the revert runs from a shell trap). The repo is clean between builds, so
+Klipper updates apply like any stock install.
+
+```bash
+bash ~/KlipperXL/scripts/build_klipperxl.sh clean
+bash ~/KlipperXL/scripts/build_klipperxl.sh -j4
+```
+
+> ⚠️ **This is automatic ONLY through the script.** A bare `make -j4` no longer picks
+> up the MODBUS source. It will build, succeed, and produce firmware with no Dwarf
+> communication at all. Always build with `build_klipperxl.sh`. The script verifies
+> `out/src/modbus_stm32f4.o` exists afterwards and refuses to report success without it.
+
+**Your own files were never at risk, and nothing about them changed.** Every KlipperXL
+module (`puppy_bootloader.py`, `modbus_stm32f4.c`, `neopixel_spi.c`, the rest) is a file
+git has never tracked. `git pull` walks past untracked files, and even `git reset --hard`
+leaves them alone. Only the two Klipper-owned Makefiles were ever the problem.
+
+- `scripts/build_klipperxl.sh` — **new.** Patch, build, verify, restore.
+- `scripts/INSTALL_ON_PI.sh` — no longer patches the Makefiles permanently; builds
+  through the helper. The two patch steps are gone, so the run is now 6 steps, and the
+  header list no longer counts the prerequisites check as a numbered step (it was off
+  by one against the `[n/8]` labels).
+- `scripts/fix_klipper_dirty.sh` — **stops setting `assume-unchanged`, and now clears**
+  **it** on upgrade, restoring both Makefiles to pristine. It still maintains the
+  `.git/info/exclude` list, which is genuinely useful: it keeps Moonraker quiet about
+  KlipperXL's untracked sources *and* protects them from `git clean -d -f`, which skips
+  ignored files. Two newer modules that post-dated the list are now included
+  (`dwarf_pa_tuner.py`, `tool_pa.py`), along with build backups.
+
+**Upgrading an existing install:** re-run `bash ~/KlipperXL/scripts/fix_klipper_dirty.sh`
+once. It clears the old flags and restores the Makefiles. After that, Klipper updates
+work — but rebuild and reflash firmware after a Klipper update, and use the helper.
+
+### ADDED: nozzle light control (`NOZZLE_LEDS`)
+
+Each Dwarf has a "cheese" LED lighting the nozzle. KlipperXL has always driven them —
+they come on with the picked tool and go dark when it docks — but there was no way to
+turn them off. The command that used to do it, `DWARF_LED`, lived in `modbus_master.py`,
+which was retired when the MODBUS monolith took over. The automatic behaviour was
+inherited; the control was not.
+
+```
+NOZZLE_LEDS [STATE=ON|OFF|ALWAYS] [TOOL=<n>]
+```
+
+| STATE | Effect |
+|---|---|
+| `ON` | lit when picked, dark when docked — stock behaviour, the default |
+| `OFF` | dark always |
+| `ALWAYS` | lit always, even parked in the dock |
+
+With no `TOOL` it applies to every **booted** Dwarf, so it is correct on an XL with
+fewer than five tools, and the setting is remembered — a Dwarf that boots later inherits
+it. With `TOOL=<n>` it changes that one tool and leaves the machine-wide setting alone.
+
+Worth knowing about the hardware: each Dwarf holds **one** register (`0xE004`) packing
+**two** brightnesses as `(selected_pwm << 8) | not_selected_pwm`, and switches between
+them itself off its `is_selected` coil. So this sets a *policy*, not an on/off state —
+the tool does its own switching as it is picked and parked. That is why one command
+covers all five without any per-toolchange work.
+
+Not persistent: a Klipper restart re-applies the default (`ON`).
+
+- `config/light_macros.cfg` — **new.** `NOZZLE_LIGHTS_ON` / `_OFF` / `_ALWAYS` wrappers,
+  because Mainsail only draws buttons for `[gcode_macro]` sections and `NOZZLE_LEDS` is
+  a Python-registered command. Put them in a Mainsail macro group (Settings → Macros →
+  Macrogroups) to get a Lights panel of their own.
+- `config/printer.cfg` — includes `light_macros.cfg`; removed a duplicate
+  `[gcode_macro STALLGUARD_Z_ALIGN]` (the same alias was defined twice).
+
+---
+
 ## 2026-09-24
 
 ### FIXED: buttons on the display could wreck a running print

@@ -1994,6 +1994,11 @@ class PuppyBootloader:
         # {dwarf_num: True while its last fan write failed} - edge-trigger
         # for _fan_warn_once() so a bus fault warns once, not 217 times.
         self.fan_write_failed = {}
+        # Live cheese-LED policy. The class constants are only the DEFAULTS;
+        # NOZZLE_LEDS overwrites these, and _configure_cheese_led() reads them,
+        # so the chosen setting also lands on a Dwarf that boots later.
+        self.led_selected_pwm = self.LED_SELECTED_PWM
+        self.led_not_selected_pwm = self.LED_NOT_SELECTED_PWM
         self.tmc_enabled = {}  # {dwarf_num: True/False}
         self.tool_picked = False  # True if a tool is on the carriage
         # Tool whose nozzle established Z=0 at the last Z home. Applied tool
@@ -2126,6 +2131,8 @@ class PuppyBootloader:
             desc="Scan for MODBUS devices")
         self.gcode.register_command("MODBUS_WRITE", self.cmd_MODBUS_WRITE,
             desc="Write MODBUS register")
+        self.gcode.register_command("NOZZLE_LEDS", self.cmd_NOZZLE_LEDS,
+            desc="Nozzle lights: STATE=ON|OFF|ALWAYS [TOOL=<n>]")
 
         # Standard gcode commands for heater/fan/tool control
         # Override M104/M109 at klippy:ready to handle T parameter for multi-tool
@@ -5464,10 +5471,14 @@ class PuppyBootloader:
         self.bed_faults_cleared = True
         return True
 
-    def _configure_cheese_led(self, dwarf):
+    def _configure_cheese_led(self, dwarf, value=None):
         """Configure a Dwarf's cheese LED: on when selected, off when not.
-        The Dwarf automatically switches based on is_selected coil."""
-        value = (self.LED_SELECTED_PWM << 8) | self.LED_NOT_SELECTED_PWM
+        The Dwarf automatically switches based on is_selected coil.
+
+        value=None uses the live policy set by NOZZLE_LEDS. Callers that need a
+        specific pattern (DOCK_CALIBRATE lights a dock solid) pass it directly."""
+        if value is None:
+            value = (self.led_selected_pwm << 8) | self.led_not_selected_pwm
         return self._write_register(dwarf, self.LED_REG_CHEESE, value)
 
     def _update_all_leds(self):
@@ -5476,6 +5487,76 @@ class PuppyBootloader:
             if not self._configure_cheese_led(dwarf):
                 # Mark for retry during polling
                 self.led_pending.add(dwarf)
+
+    def cmd_NOZZLE_LEDS(self, gcmd):
+        """NOZZLE_LEDS [STATE=ON|OFF|ALWAYS] [TOOL=<n>]
+
+        Restores the nozzle-light control that was lost when modbus_master.py
+        was retired (its DWARF_LED command went with it). The LEDs themselves
+        never stopped working - only the switch was missing.
+
+        The Dwarf holds ONE register, 0xE004, packing TWO brightnesses as
+        (selected_pwm << 8) | not_selected_pwm, and switches between them
+        ITSELF off its is_selected coil. So this sets a POLICY, not a state -
+        the tool does its own on/off as it is picked and parked.
+
+            ON      lit when picked, dark when docked   (stock behaviour)
+            OFF     dark always
+            ALWAYS  lit always - what DOCK_CALIBRATE uses to mark a dock
+
+        With no TOOL it applies to every BOOTED Dwarf, so it is correct on an
+        XL with fewer than 5 tools, and the setting is remembered so a Dwarf
+        that boots later gets it too. With TOOL=<n> it changes that one tool
+        only and leaves the machine-wide policy alone.
+
+        NOT persistent: a Klipper restart re-applies the defaults, because
+        _update_all_leds() runs from the boot path and nothing saves this.
+        """
+        state = gcmd.get('STATE', 'ON').upper()
+        levels = {
+            'ON':     (self.LED_SELECTED_PWM, self.LED_NOT_SELECTED_PWM),
+            'OFF':    (0, 0),
+            'ALWAYS': (255, 255),
+        }
+        if state not in levels:
+            raise gcmd.error(
+                "NOZZLE_LEDS: STATE must be ON, OFF or ALWAYS (got '%s')"
+                % state)
+        sel, unsel = levels[state]
+
+        tool = gcmd.get_int('TOOL', None)
+        if tool is None:
+            # Machine-wide: remember it so late-booting tools inherit it.
+            self.led_selected_pwm = sel
+            self.led_not_selected_pwm = unsel
+            targets = sorted(self.booted_dwarfs)
+            if not targets:
+                gcmd.respond_info("NOZZLE_LEDS: no Dwarfs booted")
+                return
+        else:
+            dwarf = tool + 1
+            if dwarf not in self.booted_dwarfs:
+                raise gcmd.error(
+                    "NOZZLE_LEDS: T%d (Dwarf %d) not available" % (tool, dwarf))
+            targets = [dwarf]
+
+        value = (sel << 8) | unsel
+        done, failed = [], []
+        for dwarf in targets:
+            if self._configure_cheese_led(dwarf, value):
+                done.append(dwarf - 1)
+            else:
+                failed.append(dwarf - 1)
+                self.led_pending.add(dwarf)
+
+        if done:
+            gcmd.respond_info(
+                "Nozzle LEDs %s: %s"
+                % (state, ", ".join("T%d" % t for t in done)))
+        if failed:
+            gcmd.respond_info(
+                "!! Nozzle LED write failed: %s - will retry on the next poll"
+                % ", ".join("T%d" % t for t in failed))
 
     def _read_input_registers(self, dwarf, reg_start, count):
         """Read input registers from a Dwarf, return list of values or None"""

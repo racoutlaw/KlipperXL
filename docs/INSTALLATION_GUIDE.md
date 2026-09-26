@@ -180,13 +180,35 @@ Save and exit.
 
 ### 3.5 Build the Firmware
 
+**Build with the KlipperXL helper, not a bare `make`:**
+
 ```bash
-cd ~/klipper
-make clean
-make -j4
+bash ~/KlipperXL/scripts/build_klipperxl.sh clean
+bash ~/KlipperXL/scripts/build_klipperxl.sh -j4
 ```
 
-You should see `Compiling out/src/modbus_stm32f4.o` in the output.
+> ⚠️ **Do not run `make -j4` directly.** It will build and succeed, and the
+> firmware it produces will have **no MODBUS support** — the board will flash
+> fine and then be unable to talk to any Dwarf.
+>
+> **Why:** KlipperXL adds two C files to Klipper's MCU build, and Klipper has no
+> hook for out-of-tree sources. The only way in is to add one line each to
+> `src/Makefile` and `src/stm32/Makefile` — two files that belong to Klipper.
+>
+> Leaving those edits in place permanently is what used to break Klipper
+> updates: `git pull` compares real file content and aborts with *"Your local
+> changes to the following files would be overwritten by merge"*. Moonraker then
+> treats the repo as diverged and falls back to `git reset --hard`, which would
+> silently delete the MODBUS line.
+>
+> So `build_klipperxl.sh` adds the two lines, builds, and **puts the files
+> back** — including if the build fails or you interrupt it. The repo is clean
+> at rest, Klipper updates apply normally, and your own files are untouched
+> throughout (git never tracked them).
+
+You should see `Compiling out/src/modbus_stm32f4.o` in the output. The script
+also checks for `out/src/modbus_stm32f4.o` afterwards and refuses to report
+success without it.
 A few warnings about unused functions are normal. This creates `~/klipper/out/klipper.bin`
 
 ### 3.6 Package the Firmware as .bbf
@@ -409,9 +431,8 @@ Klipper should now connect to the XLBuddy. Check the web UI or `sudo systemctl s
 Once set up, updating Klipper is simple — no opening the printer, no jumper:
 
 ```bash
-cd ~/klipper
-make clean
-make -j4
+bash ~/KlipperXL/scripts/build_klipperxl.sh clean
+bash ~/KlipperXL/scripts/build_klipperxl.sh -j4
 ~/klippy-env/bin/python ~/KlipperXL/scripts/pack_fw.py ~/klipper/out/klipper.bin \
   --no-sign --version 1.0.0+1 --printer-type 3 \
   --printer-version 1 --printer-subversion 0 --bbf-version 2
@@ -927,7 +948,7 @@ Full details, including how to get a more precise number:
   ```bash
   sudo apt install build-essential gcc-arm-none-eabi
   ```
-- Then retry: `make clean && make -j4`
+- Then retry: `bash ~/KlipperXL/scripts/build_klipperxl.sh clean && bash ~/KlipperXL/scripts/build_klipperxl.sh -j4`
 
 ### "Multiple definitions for command 'identify'" during firmware build
 - The `.config` file is outdated or incompatible with your Klipper version
@@ -1143,9 +1164,12 @@ make menuconfig
 Change **Bootloader offset** to **No bootloader**, save and exit. Then:
 
 ```bash
-make clean
-make -j4
+bash ~/KlipperXL/scripts/build_klipperxl.sh clean
+bash ~/KlipperXL/scripts/build_klipperxl.sh -j4
 ```
+
+> ⚠️ Again — the helper, not a bare `make`. A plain `make` here produces a
+> binary with no MODBUS support. See [Section 3.5](#35-build-the-firmware).
 
 ### 12.2 Enter DFU Mode
 

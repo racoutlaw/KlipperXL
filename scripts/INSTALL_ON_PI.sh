@@ -12,15 +12,13 @@
 #
 # Usage: bash ~/KlipperXL/scripts/INSTALL_ON_PI.sh
 #
-# This will:
-# 1. Check prerequisites
-# 2. Copy MODBUS module to Klipper source
-# 3. Copy Python extras to Klipper
-# 4. Deploy config files
-# 5. Set up the Pressure Advance analyser in its own venv
-# 6. Patch the STM32 Makefile
-# 7. Launch make menuconfig for build setup
-# 8. Build firmware
+# Prerequisites are checked first, then:
+# 1. Copy MODBUS module to Klipper source
+# 2. Copy Python extras to Klipper
+# 3. Deploy config files
+# 4. Set up the Pressure Advance analyser in its own venv
+# 5. Launch make menuconfig for build setup
+# 6. Build firmware (Makefiles patched only for the build, then restored)
 
 set -e
 
@@ -82,14 +80,14 @@ if [ ! -f "$MODULE_DIR/src/modbus_stm32f4.c" ]; then
 fi
 
 # Step 1: Copy MODBUS MCU module
-echo "[1/8] Copying MODBUS module to Klipper source..."
+echo "[1/6] Copying MODBUS module to Klipper source..."
 cp "$MODULE_DIR/src/modbus_stm32f4.c" ~/klipper/src/
 cp "$MODULE_DIR/src/neopixel_spi.c" ~/klipper/src/
 echo "  Done."
 
 # Step 2: Copy Python extras
 echo ""
-echo "[2/8] Copying Python extras to Klipper..."
+echo "[2/6] Copying Python extras to Klipper..."
 cp "$MODULE_DIR/klippy/modbus_master.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/puppy_bootloader.py" ~/klipper/klippy/extras/
 cp "$MODULE_DIR/klippy/loadcell_probe.py" ~/klipper/klippy/extras/
@@ -104,7 +102,7 @@ echo "  Done (numpy installed for input shaper)."
 
 # Step 3: Deploy config files
 echo ""
-echo "[3/8] Deploying configuration files..."
+echo "[3/6] Deploying configuration files..."
 cp "$MODULE_DIR/config/printer.cfg" ~/printer_data/config/printer.cfg
 cp "$MODULE_DIR/config/tool_offsets.cfg" ~/printer_data/config/tool_offsets.cfg
 cp "$MODULE_DIR/config/variables.cfg" ~/printer_data/config/variables.cfg
@@ -125,7 +123,7 @@ echo "    - timelapse.cfg    needs moonraker-timelapse            (guide 8.3)"
 
 # Step 4: Pressure Advance analyser, in its OWN venv
 echo ""
-echo "[4/8] Setting up the Pressure Advance analyser..."
+echo "[4/6] Setting up the Pressure Advance analyser..."
 echo ""
 echo "  This goes in its own virtualenv, NOT klippy-env. scipy is a heavy"
 echo "  scientific stack and must never be able to disturb the environment"
@@ -189,40 +187,9 @@ echo ""
 echo "  Tune each tool with PA_TUNE_T0 .. PA_TUNE_T4 (~6 min per tool), then"
 echo "  SAVE_CONFIG. Every tool stores its OWN value - docs/PRESSURE_ADVANCE.md"
 
-# Step 5: Patch src/Makefile for neopixel_spi (strobe feature)
+# Step 5: Configure build via menuconfig
 echo ""
-echo "[5/8] Patching src/Makefile for neopixel_spi..."
-KLIPPER_SRC_MK=~/klipper/src/Makefile
-if grep -q "neopixel_spi" "$KLIPPER_SRC_MK"; then
-    echo "  neopixel_spi.c already in src/Makefile - skipping"
-else
-    sed -i '/^src-$(CONFIG_WANT_NEOPIXEL) += neopixel.c$/a src-$(CONFIG_WANT_NEOPIXEL) += neopixel_spi.c' "$KLIPPER_SRC_MK"
-    echo "  src/Makefile: added neopixel_spi.c"
-fi
-
-# Step 6: Patch STM32 Makefile
-echo ""
-echo "[6/8] Patching STM32 Makefile..."
-
-STM32_MK=~/klipper/src/stm32/Makefile
-
-if grep -q "modbus_stm32f4" "$STM32_MK"; then
-    echo "  Already patched, skipping."
-else
-    sed -i '/^src-\$(CONFIG_MACH_STM32F4) += stm32\/stm32f4.c/a src-$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c' "$STM32_MK"
-    if grep -q "modbus_stm32f4" "$STM32_MK"; then
-        echo "  Done."
-    else
-        echo "  WARNING: Automatic patching failed."
-        echo "  Please manually edit ~/klipper/src/stm32/Makefile"
-        echo "  Find the line: src-\$(CONFIG_MACH_STM32F4) += stm32/stm32f4.c ..."
-        echo "  Add below it:  src-\$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c"
-    fi
-fi
-
-# Step 7: Configure build via menuconfig
-echo ""
-echo "[7/8] Build configuration..."
+echo "[5/6] Build configuration..."
 echo ""
 echo "  make menuconfig will now launch. Set these options:"
 echo "    - Micro-controller Architecture: STMicroelectronics STM32"
@@ -245,12 +212,28 @@ read -p "  Press Enter to launch menuconfig..."
 cd ~/klipper
 make menuconfig
 
-# Step 8: Build and package as .bbf for the Prusa bootloader
+# Step 6: Build and package as .bbf for the Prusa bootloader
 echo ""
-echo "[8/8] Building firmware..."
+echo "[6/6] Building firmware..."
 
-make clean
-make -j4
+# Build through the helper, NOT a bare `make`.
+#
+# KlipperXL adds two C files to Klipper's MCU build, and Klipper has no hook
+# for out-of-tree sources - the only way in is to edit two files that belong
+# to Klipper: src/Makefile and src/stm32/Makefile.
+#
+# Earlier versions of this installer edited them permanently. That quietly
+# broke every future Klipper update, because `git pull` compares real file
+# content and refuses to overwrite local changes:
+#
+#     error: Your local changes to the following files would be overwritten
+#     by merge: src/Makefile
+#
+# build_klipperxl.sh adds those two lines, builds, and puts the files back -
+# so the repo is clean at rest and Klipper updates apply normally. It also
+# restores them if the build fails or is interrupted.
+bash "$MODULE_DIR/scripts/build_klipperxl.sh" clean
+bash "$MODULE_DIR/scripts/build_klipperxl.sh" -j4
 
 echo ""
 echo "  Packaging klipper.bin as a .bbf for the Prusa bootloader..."
@@ -304,7 +287,7 @@ echo "  3. Update serial port in printer.cfg:"
 echo "     ls /dev/serial/by-id/"
 echo "     nano ~/printer_data/config/printer.cfg"
 echo ""
-echo "  4. Fix Klipper dirty state:"
+echo "  4. Hide KlipperXL's added files from Moonraker's update manager:"
 echo "     bash ~/KlipperXL/scripts/fix_klipper_dirty.sh"
 echo "     sudo systemctl restart moonraker"
 echo ""

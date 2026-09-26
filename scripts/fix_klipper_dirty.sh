@@ -13,7 +13,7 @@
 #
 # This script fixes it by:
 # 1. Adding custom files to .git/info/exclude (local gitignore)
-# 2. Marking modified tracked files as assume-unchanged
+# 2. Clearing the OLD assume-unchanged flags (they hid a real problem)
 # 3. Clearing Moonraker's cached dirty state
 #
 # Run this ON THE PI after deploying all KlipperXL files.
@@ -62,14 +62,44 @@ EOF
     echo "  Done."
 fi
 
-# Step 2: Mark modified tracked files as assume-unchanged
+# Step 2: UNDO the old assume-unchanged flags (migration from older KlipperXL)
+#
+# Earlier versions of this script marked src/Makefile and src/stm32/Makefile
+# as assume-unchanged, because the installer edited them permanently and the
+# repo therefore always looked dirty.
+#
+# That was the wrong fix. assume-unchanged only hides a file from `git status`
+# - it does NOT stop `git merge` reading the bytes. So Moonraker reported the
+# repo clean and valid while every Klipper update still failed with:
+#
+#     error: Your local changes to the following files would be overwritten
+#     by merge: src/Makefile
+#
+# Worse, Moonraker treats that as a diverged repo and falls back to
+# `git reset --hard`, which would silently delete the MODBUS build line and
+# leave a firmware that cannot talk to the Dwarfs at all.
+#
+# KlipperXL no longer edits those files at rest - scripts/build_klipperxl.sh
+# adds the lines, builds, and puts them back. So the flags must come OFF.
 echo ""
-echo "Step 2: Marking modified Makefiles as assume-unchanged..."
+echo "Step 2: Clearing old assume-unchanged flags..."
 cd "$KLIPPER_DIR"
 
-# These are tracked files we modified to add modbus_stm32f4.c to the build
-git update-index --assume-unchanged src/stm32/Makefile 2>/dev/null && echo "  src/stm32/Makefile marked" || echo "  src/stm32/Makefile not found (OK)"
-git update-index --assume-unchanged src/Makefile 2>/dev/null && echo "  src/Makefile marked (strobe)" || echo "  src/Makefile not found (OK)"
+for f in src/Makefile src/stm32/Makefile; do
+    if git ls-files -v "$f" 2>/dev/null | grep -q '^[a-z]'; then
+        git update-index --no-assume-unchanged "$f"
+        echo "  $f - flag cleared"
+        if ! git diff --quiet -- "$f"; then
+            git checkout -- "$f"
+            echo "  $f - restored to pristine (build-time patching is used now)"
+        fi
+    else
+        echo "  $f - no flag set (OK)"
+    fi
+done
+echo ""
+echo "  NOTE: build firmware with scripts/build_klipperxl.sh from now on."
+echo "  A plain 'make' will now produce a binary with NO MODBUS support."
 
 # Step 3: Clear Moonraker's cached dirty state
 echo ""
@@ -92,8 +122,8 @@ else
     echo "  WARNING: Still showing modified files:"
     echo "$DIRTY"
     echo ""
-    echo "  You may need to run: git update-index --assume-unchanged <file>"
-    echo "  for each file listed above."
+    echo "  If a Makefile is listed, an interrupted build left it patched. Fix with:"
+    echo "    cd ~/klipper && git checkout -- src/Makefile src/stm32/Makefile"
 fi
 
 echo ""
