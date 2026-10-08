@@ -1,3 +1,16 @@
+## 2026-10-08
+
+### CHANGED: tool offset calibration cleans the nozzles at 100 °C, not 200 °C
+
+- `CALIBRATE_TOOL_OFFSETS` heats every nozzle for the cleaning step, then cools
+  them to 70 °C for the pin. At the old 200 °C default, nozzles with filament
+  loaded oozed while they sat hot waiting for their turn to be cleaned
+- Tested on the owner's XL: at 100 °C they did not ooze, and the cool-down to
+  70 °C is shorter
+- Only the default changed: `CLEAN_TEMP=` still takes any temperature
+  (`CALIBRATE_TOOL_OFFSETS CLEAN_TEMP=200` for the old behaviour)
+- `klippy/puppy_bootloader.py` — one line
+
 ## 2026-09-26
 
 ### FIXED: Klipper updates always failed, and the reason was hidden on purpose

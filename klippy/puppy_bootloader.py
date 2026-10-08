@@ -1105,7 +1105,7 @@ class LoadcellProbe:
         probe_speed = gcmd.get_float('SPEED', 3.0, above=0.)  # Prusa PROBE_FEEDRATE_MMS = 3 mm/s
         tools = gcmd.get('TOOLS', '0,1,2,3,4')  # Which tools to calibrate
         skip_clean = gcmd.get_int('SKIP_CLEAN', 0)  # Skip nozzle cleaning phase
-        clean_temp = gcmd.get_float('CLEAN_TEMP', 200.0)  # Temperature for cleaning
+        clean_temp = gcmd.get_float('CLEAN_TEMP', 100.0)  # Temperature for cleaning (at 200 loaded nozzles ooze)
         cal_temp = gcmd.get_float('CAL_TEMP', 70.0)  # Prusa TOOL_CALIBRATION_TEMPERATURE = 70C
         clean_time = gcmd.get_float('CLEAN_TIME', 30.0)  # Seconds per tool for cleaning
         wait_time = gcmd.get_float('WAIT_TIME', 30.0)  # Seconds to wait for user actions
