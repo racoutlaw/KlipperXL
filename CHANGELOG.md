@@ -19,7 +19,10 @@
   at 400 mm/s, then 3 mm further left before the normal Y and X homing
 - Skipped when a tool is on the carriage (stock: it would throw the tool) —
   checked from the tracked tool state and from each dock's Hall sensors
-- On the owner's XL the two right-edge hits agreed within 0.012 mm on the first run
+- Tested on the owner's XL: the two right-edge hits agreed within 0.012 mm
+  (homing from unknown) and 0.000 mm (already homed). With the carriage lock
+  pushed closed by hand, the bump opened it and the next pick coupled the
+  tool. With a tool on the carriage it skipped the bump and homed normally
 
 **To update:**
 
