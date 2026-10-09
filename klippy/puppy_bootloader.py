@@ -1803,6 +1803,21 @@ class PuppyBootloader:
     SAFE_Y_WITH_TOOL = 360.0    # SAFE_Y_WITH_TOOL from Prusa
     SAFE_Y_WITHOUT_TOOL = 425.0 # SAFE_Y_WITHOUT_TOOL from Prusa
 
+    # Stock G28 toolchanger lock alignment (XL_ALIGN_LOCKS) - Prusa-Firmware-
+    # Buddy 6.4.0 G28.cpp l.718-731, toolchanger.cpp align_locks() l.715-757,
+    # motion.cpp homeaxis() l.1258-1520, Configuration_XL(_adv).h,
+    # marlin_stubs/XL/configuration.hpp
+    ALIGN_X_MAX_POS = 361.0     # X_MAX_POS = X_BED_SIZE 360 - X_MIN_OFFSET -1
+    ALIGN_X_MIN_POS = -8.0      # X_MIN_POS = -7 - X_MAX_OFFSET
+    ALIGN_HOMING_SPEED = 52.0   # HOMING_FEEDRATE_XY (52*60 mm/min)
+    ALIGN_BUMP_MM = 20.0        # X_HOME_BUMP_MM - back off between the hits (divisor 1)
+    ALIGN_MOVE_BACK_MM = 3.0    # MOVE_BACK_BEFORE_HOMING_DISTANCE
+    ALIGN_MAX_ATTEMPTS = 10     # HOMING_MAX_ATTEMPTS
+    ALIGN_MAX_DIFF = 1.0        # axis_home_invert_min/max_diff: -1 .. +1 mm
+    ALIGN_BACKOFF_MM = 2.0      # HOMING_BACKOFF_POST_MM (X)
+    ALIGN_SLOW_SPEED = 50.0     # SLOW_MOVE_MM_S
+    ALIGN_TRAVEL_SPEED = 400.0  # TRAVEL_MOVE_MM_S
+
     # Pick/Park motion offsets (from Prusa toolchanger_utils.h)
     PICK_Y_OFFSET = -5.0       # PICK_Y_OFFSET from Prusa (5mm toward front from dock)
     PICK_X_OFFSET_1 = -11.8    # Lock engage start
@@ -2277,6 +2292,9 @@ class PuppyBootloader:
             desc="Pick up a tool from its dock")
         self.gcode.register_command("TOOL_PARK", self.cmd_TOOL_PARK,
             desc="Park the current tool in its dock")
+        self.gcode.register_command("XL_ALIGN_LOCKS", self.cmd_XL_ALIGN_LOCKS,
+            desc="Stock G28 step: bump the right edge to align the tool locks"
+                 " ([homing_override] runs it)")
         self.gcode.register_command("DOCK_STATUS", self.cmd_DOCK_STATUS,
             desc="Read dock Hall sensors from Dwarf")
         self.gcode.register_command("DOCK_POSITIONS", self.cmd_DOCK_POSITIONS,
@@ -5967,6 +5985,149 @@ class PuppyBootloader:
         if result and len(result) >= 2:
             return (result[0], result[1])  # (is_picked, is_parked)
         return None
+
+    # ---------------------------------------------------------------
+    # Toolchanger lock alignment, as stock Prusa G28 does it.
+    #
+    # Before every X+Y home with no tool on the carriage, stock bumps the right
+    # edge so the carriage's locking plates line up (a crash can leave the
+    # lock part-closed, and the next pick then misses the tool).  Klipper's
+    # G28 homes X in one direction only, so this runs Klipper's own homing
+    # move (homing.py HomingMove) to the right on the same X stall endstop.
+    # [homing_override] calls it after the stall detection is set up:
+    #   XL_ALIGN_LOCKS HOME_X=0|1 HOME_Y=0|1 [X= Y=]
+    # X / Y = the real position when that axis was homed before this G28 (the
+    # override has set X=180 Y=180 by then).
+    # ---------------------------------------------------------------
+    def cmd_XL_ALIGN_LOCKS(self, gcmd):
+        home_x = gcmd.get_int('HOME_X', 1)
+        home_y = gcmd.get_int('HOME_Y', 1)
+        known_x = gcmd.get_float('X', None)
+        known_y = gcmd.get_float('Y', None)
+        aligned = False
+        # G28.cpp l.718-726: homing X and Y -> align the locking plates
+        if home_x and home_y:
+            why = self._align_tool_on_carriage()
+            if why:
+                gcmd.respond_info("Lock alignment skipped: %s" % (why,))
+            else:
+                self._align_locks(gcmd, known_x, known_y)
+                aligned = True
+        # G28.cpp l.728-731: X unknown or near the right edge -> a bit left
+        # ("Move a bit left to avoid unlocking the tool").  Only when this G28
+        # homes X: the override sets X=180 for the others.
+        if home_x and (aligned or known_x is None or
+                       known_x > self.ALIGN_X_MAX_POS - self.ALIGN_MOVE_BACK_MM):
+            self._align_homing_move(0, -self.ALIGN_MOVE_BACK_MM,
+                                    self.ALIGN_HOMING_SPEED, must_trigger=False)
+
+    def _align_tool_on_carriage(self):
+        """Why the locks must not be bumped, or None.  align_locks(): with a
+        tool picked "It would catapult picked dwarf".  The tracked state first,
+        then the Hall sensors, as the startup auto-detect reads them."""
+        if self.tool_picked:
+            return "T%d is on the carriage" % (self.active_tool,)
+        for dwarf in sorted(self.booted_dwarfs):
+            state = self._get_dock_state(dwarf)
+            if state is None:
+                return "T%d dock sensors did not answer" % (dwarf - 1,)
+            if state[0]:
+                return "T%d reads picked (Hall sensor)" % (dwarf - 1,)
+        return None
+
+    def _align_locks(self, gcmd, known_x, known_y):
+        """PrusaToolChanger::align_locks() (toolchanger.cpp l.715-757)."""
+        toolhead = self.printer.lookup_object('toolhead')
+        gcmd.respond_info("Aligning the tool locks (right edge bump)")
+        if known_x is not None and known_y is not None:
+            # can_move_safely(): X and Y were homed - real position back
+            toolhead.wait_moves()
+            pos = toolhead.get_position()
+            pos[0], pos[1] = known_x, known_y
+            toolhead.set_position(pos, homing_axes="xy")
+            if known_y > self.SAFE_Y_WITHOUT_TOOL:
+                toolhead.manual_move([None, self.SAFE_Y_WITHOUT_TOOL, None],
+                                     self.ALIGN_SLOW_SPEED)
+            # "Go to the front right corner quickly"
+            toolhead.manual_move([self.ALIGN_X_MAX_POS, 0., None],
+                                 self.ALIGN_TRAVEL_SPEED)
+        else:
+            # "A bit back in case the carriage is near tool"
+            self._align_homing_move(1, self.SAFE_Y_WITHOUT_TOOL - self.DOCK_Y,
+                                    self.ALIGN_HOMING_SPEED, must_trigger=False)
+        toolhead.wait_moves()
+        self._align_home_x_inverted(gcmd)       # "Bump right edge"
+        # current_position.x = X_MAX_POS; "Return to left edge before homing"
+        pos = toolhead.get_position()
+        pos[0] = self.ALIGN_X_MAX_POS
+        toolhead.set_position(pos, homing_axes="x")
+        toolhead.manual_move([0., None, None], self.ALIGN_TRAVEL_SPEED)
+        toolhead.wait_moves()
+
+    def _align_home_x_inverted(self, gcmd):
+        """homeaxis(X_AXIS, 0, true): 3 mm away, hit the right edge at
+        52 mm/s, 20 mm back, hit it again (same speed); the two hits must agree
+        within 1 mm, else again (10 attempts); then 2 mm off the edge."""
+        length = self.ALIGN_X_MAX_POS - self.ALIGN_X_MIN_POS   # max_length(X)
+        for attempt in range(self.ALIGN_MAX_ATTEMPTS):
+            self._align_move(0, -self.ALIGN_MOVE_BACK_MM, self.ALIGN_HOMING_SPEED)
+            self._align_homing_move(0, 1.5 * length, self.ALIGN_HOMING_SPEED,
+                                    must_trigger=True)
+            self._align_move(0, -self.ALIGN_BUMP_MM, self.ALIGN_HOMING_SPEED)
+            travel = self._align_homing_move(0, 2 * self.ALIGN_BUMP_MM,
+                                             self.ALIGN_HOMING_SPEED,
+                                             must_trigger=True)
+            diff = travel - self.ALIGN_BUMP_MM            # 2nd hit - 1st hit
+            logging.info("PuppyBootloader: right edge hits %.3f mm apart"
+                         " (attempt %d)" % (diff, attempt + 1))
+            if -self.ALIGN_MAX_DIFF <= diff <= self.ALIGN_MAX_DIFF:
+                break
+            gcmd.respond_info("Right edge hits %.3f mm apart - again" % (diff,))
+        else:
+            raise gcmd.error("Toolchanger lock alignment failed: the right edge"
+                             " hits never agreed within %.0f mm"
+                             % (self.ALIGN_MAX_DIFF,))
+        self._align_move(0, -self.ALIGN_BACKOFF_MM, self.ALIGN_HOMING_SPEED)
+
+    def _align_frame(self, axis, start):
+        # this axis is homed again after the alignment: put it at `start` so
+        # the move's end is inside the axis range (check_move tests the end)
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.wait_moves()
+        pos = toolhead.get_position()
+        pos[axis] = start
+        toolhead.set_position(pos, homing_axes="xyz"[axis])
+        return pos
+
+    def _align_move(self, axis, dist, speed):
+        """do_homing_move_axis_rel(): a plain move of `dist` mm."""
+        toolhead = self.printer.lookup_object('toolhead')
+        lo, hi = toolhead.get_kinematics().rails[axis].get_range()
+        pos = self._align_frame(axis, hi if dist < 0 else lo)
+        coord = [None, None, None]
+        coord[axis] = pos[axis] + dist
+        toolhead.manual_move(coord, speed)
+        toolhead.wait_moves()
+
+    def _align_homing_move(self, axis, dist, speed, must_trigger):
+        """do_homing_move(): move `dist` mm along X (0) / Y (1), stopping on
+        that axis' stall endstop.  Returns the distance moved before the
+        trigger (the full length when it did not trigger)."""
+        from . import homing as homing_mod
+        toolhead = self.printer.lookup_object('toolhead')
+        rail = toolhead.get_kinematics().rails[axis]
+        lo, hi = rail.get_range()
+        start = hi - dist if dist > 0 else lo - dist
+        pos = self._align_frame(axis, start)
+        target = list(pos)
+        target[axis] = start + dist
+        hmove = homing_mod.HomingMove(self.printer, rail.get_endstops())
+        trig = hmove.homing_move(target, speed, probe_pos=True,
+                                 check_triggered=must_trigger)
+        if must_trigger and hmove.check_no_movement() is not None:
+            raise self.printer.command_error(
+                "%s stall endstop triggered before moving" % ("xy"[axis],))
+        return abs(trig[axis] - start)
 
     def _get_dock_x(self, tool):
         """Get dock X position for tool number (0-4)"""

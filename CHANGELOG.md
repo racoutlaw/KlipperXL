@@ -1,5 +1,38 @@
 ## 2026-10-08
 
+### ADDED: homing bumps the right edge first, as stock does, to align the tool locks
+
+- Stock Prusa firmware does this before every X+Y home with no tool on the
+  carriage (`G28.cpp`, `PrusaToolChanger::align_locks()`): it moves clear of the
+  docks, runs to the front right corner, homes against the **right** edge, then
+  goes to the far left and homes normally. Hitting the right edge lines the
+  carriage's locking plates back up
+- Without it, a lock left part-closed — after a crash, for example — makes
+  the next pick miss: the carriage reaches the dock but never couples the tool
+- Klipper's `G28` only homes X toward one side, which is why this was missing.
+  Underneath it is Klipper's own homing move, which works in either direction:
+  the new `XL_ALIGN_LOCKS` command uses it to the right on the same X stall
+  endstop, and `[homing_override]` runs it right after the stall setup
+- Stock's sequence and numbers (Prusa-Firmware-Buddy 6.4.0): 3 mm left, hit the
+  right edge at 52 mm/s, back 20 mm, hit it again; the two hits must agree
+  within 1 mm or it repeats (up to 10 times); 2 mm off the edge, to the far left
+  at 400 mm/s, then 3 mm further left before the normal Y and X homing
+- Skipped when a tool is on the carriage (stock: it would throw the tool) —
+  checked from the tracked tool state and from each dock's Hall sensors
+- On the owner's XL the two right-edge hits agreed within 0.012 mm on the first run
+
+**To update:**
+
+1. `cp klippy/puppy_bootloader.py ~/klipper/klippy/extras/`
+2. In **your own** `printer.cfg`, in `[homing_override]`, add the
+   `XL_ALIGN_LOCKS ...` line (with its comment) right after `G4 P1000` — copy
+   it from `config/printer.cfg`. Do not copy the shipped file over yours
+3. `sudo systemctl restart klipper` — a console `RESTART` does not reload
+   Python modules, and `[homing_override]` would then call an unknown command
+
+Files: `klippy/puppy_bootloader.py` (`XL_ALIGN_LOCKS`), `config/printer.cfg`
+(one line in `[homing_override]`)
+
 ### CHANGED: tool offset calibration cleans the nozzles at 100 °C, not 200 °C
 
 - `CALIBRATE_TOOL_OFFSETS` heats every nozzle for the cleaning step, then cools
