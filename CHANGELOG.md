@@ -1,3 +1,60 @@
+## 2026-10-24
+
+Three changes brought over from KlipperXL-Plus, where they run on the printer.
+
+### CHANGED: a load asks which filament, as stock does
+
+- A load (`FILAMENT_LOAD` / `LOAD_FILAMENT`) or an autoload stops once the
+  gears have the filament and asks its type in a Mainsail pop-up: PLA 215,
+  PETG 230, ASA 260, PC 275, PVB 215, ABS 255, HIPS 220, PP 240, FLEX 240,
+  PA 285 °C - stock Prusa's temperatures - or Cancel, which takes the filament
+  back out of the gears. Then it heats to that and loads and purges as before
+- Before, everything loaded at 200 °C unless you typed a temperature, so ABS
+  or PETG went in too cold
+- A tool already heating, or `LOAD_FILAMENT TEMP=t`, is not asked
+- Each tool remembers its type (in `variables.cfg`) and its unload heats for
+  it. `FILAMENT_UNLOAD` on a tool whose type is not known asks the same
+  question before anything moves. `UNLOAD_FILAMENT` from `M600` or a script
+  still falls back to 200 °C
+- No pop-up on your screen? The console shows the answer as a command:
+  `XL_FILAMENT_TYPE TOOL=n TYPE=ABS` (or `TEMP=250`, or `CANCEL=1`)
+
+### FIXED: the Load / Unload buttons fell back to T0
+
+- With no TOOL they used T0, so a tool number typed into the TEMP box by
+  mistake loaded or unloaded T0
+- Now no TOOL means the tool on the carriage; with none picked they refuse
+  and ask for TOOL. The buttons have no TEMP box any more
+
+### FIXED: the lock alignment could drive the carriage into the left frame
+
+- Homing X and Y with no tool on bumps the right edge twice (as stock), then
+  goes back to the left. Stock goes back at 400 mm/s, trusting the bump. On
+  KlipperXL-Plus (same mainboard motion) the two hits once tripped near the
+  front-left corner instead of at the edge, and that run drove the carriage
+  into the left frame
+- The way back is now made at homing speed, stopping at the frame and
+  measuring the width (378-379 mm on KlipperXL-Plus); a short one stops with
+  an error instead. A full home with no tool on takes about 6 s longer
+
+**Tested** with Python against the real `puppy_bootloader.py` and
+`filament_macros.cfg`, only the hardware faked: 47 of 47 - the question and
+each answer, Cancel, the unload cases, `M600`'s unload unchanged, the
+buttons' TOOL handling, and the alignment with a real and a false bump. The
+same changes run on KlipperXL-Plus on the printer. Not run on a KlipperXL
+install
+
+**To update** (in your KlipperXL folder, after `git pull`):
+
+```
+cp klippy/puppy_bootloader.py ~/klipper/klippy/extras/
+cp config/filament_macros.cfg ~/printer_data/config/
+sudo systemctl restart klipper
+```
+
+Files: `klippy/puppy_bootloader.py`, `config/filament_macros.cfg`,
+`README.md`
+
 ## 2026-10-20
 
 Five fixes from a code review of `klippy/`. Each one changes only the case

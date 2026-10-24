@@ -1887,6 +1887,21 @@ class PuppyBootloader:
     ALIGN_BACKOFF_MM = 2.0      # HOMING_BACKOFF_POST_MM (X)
     ALIGN_SLOW_SPEED = 50.0     # SLOW_MOVE_MM_S
     ALIGN_TRAVEL_SPEED = 400.0  # TRAVEL_MOVE_MM_S
+    # After the right edge bump the way back to the left frame is the whole X
+    # width; less than this and the two hits were not the right edge
+    ALIGN_MIN_WIDTH = 0.9 * (ALIGN_X_MAX_POS - ALIGN_X_MIN_POS)
+
+    # Filament types, stock order and nozzle temperatures (Prusa-Firmware-
+    # Buddy src/common/filament.cpp preset_filament_parameters).  Stock M1701
+    # (M701_2.cpp l.272): "catch filament in gear and then ask for temp"; the
+    # type is kept per tool (here save_variables filament_tN) and an unload
+    # heats for it.  Cancel = stock unload_from_gears (pause.cpp l.1019): the
+    # 30 mm slow load x 1.5 back, cold, at 18 mm/s.
+    FILAMENT_TEMPS = (('PLA', 215), ('PETG', 230), ('ASA', 260), ('PC', 275),
+                      ('PVB', 215), ('ABS', 255), ('HIPS', 220), ('PP', 240),
+                      ('FLEX', 240), ('PA', 285))
+    GEARS_OUT_MM = 45.0
+    GEARS_OUT_SPEED = 18.0
 
     # Pick/Park motion offsets (from Prusa toolchanger_utils.h)
     PICK_Y_OFFSET = -5.0       # PICK_Y_OFFSET from Prusa (5mm toward front from dock)
@@ -2168,6 +2183,7 @@ class PuppyBootloader:
         self.autoload_enabled = True     # Autoload when side sensor detects insertion
         self._autoload_in_progress = False
         self._autoload_insert_count = {}  # {tool: consecutive has_filament count}
+        self._filament_asking = {}       # {tool: 'autoload'|'load'|'unload'} - type asked
 
         # Loadcell state
         self.loadcell_enabled = {}   # {dwarf_num: True/False}
@@ -2337,6 +2353,10 @@ class PuppyBootloader:
         self.gcode.register_command("SET_AUTOLOAD",
             self.cmd_SET_AUTOLOAD,
             desc="Enable/disable filament autoload (SET_AUTOLOAD ENABLE=0/1)")
+        self.gcode.register_command("XL_FILAMENT_TYPE",
+            self.cmd_XL_FILAMENT_TYPE,
+            desc="Answer a load / unload that asked for the filament type:"
+                 " TYPE=PLA.. | TEMP=t | CANCEL=1")
 
         # Tool select commands T0-T4
         for i in range(5):
@@ -2976,6 +2996,9 @@ class PuppyBootloader:
             return
         if self._autoload_in_progress:
             return
+        if self._filament_asking:
+            # a load / unload is waiting for its filament type
+            return
 
         # Only autoload when idle
         try:
@@ -3065,6 +3088,75 @@ class PuppyBootloader:
             logging.exception(
                 "PuppyBootloader: could not clear melt_retract_t%d" % tool)
 
+    def _loaded_filament(self, tool):
+        """(type, temp) the last load put in this tool - save_variables
+        filament_tN = {'type': 'ABS', 'temp': 255.0} (stock config_store
+        filament_type) - or ('', 0) when it is not known."""
+        sv = self.printer.lookup_object('save_variables', None)
+        f = (sv.allVariables.get('filament_t%d' % tool)
+             if sv is not None else None)
+        if not isinstance(f, dict):
+            return '', 0.
+        try:
+            return str(f.get('type', '')), float(f.get('temp', 0.))
+        except (TypeError, ValueError):
+            return '', 0.
+
+    def _set_loaded_filament(self, tool, ftype, temp):
+        """Remember what a load put in this tool; temp 0 = unloaded/unknown.
+        Straight to save_variables, so it works from a command and from the
+        autoload callback alike."""
+        sv = self.printer.lookup_object('save_variables', None)
+        if sv is None:
+            return
+        value = {'type': ftype, 'temp': float(temp)} if temp else 0
+        try:
+            sv.cmd_SAVE_VARIABLE(self.gcode.create_gcode_command(
+                "SAVE_VARIABLE", "SAVE_VARIABLE",
+                {"VARIABLE": 'filament_t%d' % tool, "VALUE": repr(value)}))
+        except Exception:
+            logging.exception(
+                "PuppyBootloader: could not save filament_t%d" % tool)
+
+    def _ask_filament_type(self, tool, mode):
+        """Stock preheat_for_change_load / M702 preheat: the filament list as
+        a Mainsail / KlipperScreen prompt (action:prompt_*).  mode 'autoload'
+        or 'load': the filament waits in the gears; 'unload': nothing has
+        moved yet.  XL_FILAMENT_TYPE answers."""
+        self._filament_asking[tool] = mode
+        if mode == 'unload':
+            lines = [f"action:prompt_begin T{tool}: which filament is in it?",
+                     f"action:prompt_text T{tool}'s filament type is not"
+                     f" known. Pick it: T{tool} heats to it, then unloads."]
+            info = (f"T{tool}: filament type not known - pick it in the"
+                    f" pop-up, or XL_FILAMENT_TYPE TOOL={tool} TYPE=ABS"
+                    f" (or TEMP=250)")
+        else:
+            lines = [f"action:prompt_begin T{tool}: which filament?",
+                     f"action:prompt_text The filament is in the gears. Pick"
+                     f" its type: T{tool} heats to it, then loads and"
+                     f" purges."]
+            info = (f"T{tool}: filament in the gears - pick its type in the"
+                    f" pop-up, or XL_FILAMENT_TYPE TOOL={tool} TYPE=ABS (or"
+                    f" TEMP=250); CANCEL=1 takes it back out of the gears")
+        for i in range(0, len(self.FILAMENT_TEMPS), 2):
+            lines.append("action:prompt_button_group_start")
+            for name, t in self.FILAMENT_TEMPS[i:i + 2]:
+                lines.append(f"action:prompt_button {name} {t}|"
+                             f"XL_FILAMENT_TYPE TOOL={tool} TYPE={name}|primary")
+            lines.append("action:prompt_button_group_end")
+        lines.append(f"action:prompt_footer_button Cancel|XL_FILAMENT_TYPE"
+                     f" TOOL={tool} CANCEL=1|error")
+        lines.append("action:prompt_show")
+        for line in lines:
+            self.gcode.respond_raw("// " + line)
+        self.gcode.respond_info(info)
+
+    def _drop_filament_question(self, tool):
+        """A load / unload of this tool replaces a question still open."""
+        if self._filament_asking.pop(tool, None) is not None:
+            self.gcode.respond_raw("// action:prompt_end")
+
     def _do_autoload(self, tool, from_command=False):
         """Execute autoload sequence for a tool (Prusa M1701 equivalent).
 
@@ -3102,6 +3194,11 @@ class PuppyBootloader:
             self.gcode.respond_info(
                 f"T{tool}/Dwarf {dwarf} not booted - cannot autoload")
             return
+        if self._filament_asking.get(tool) in ('autoload', 'load'):
+            # its filament is already in the gears, waiting for the type
+            self._ask_filament_type(tool, self._filament_asking[tool])
+            return
+        self._drop_filament_question(tool)
 
         # Check filament sensor calibration
         cal = self.fs_calibration.get(tool, None)
@@ -3185,54 +3282,66 @@ class PuppyBootloader:
             toolhead.manual_move(pos, 5.4)
             toolhead.wait_moves()
 
-            # --- Phase 2: Heat to extrusion temperature ---
+            # Stock M1701: "catch filament in gear and then ask for temp" -
+            # nothing set: ask the filament type and stop here with the
+            # filament in the gears; XL_FILAMENT_TYPE carries on
             temp = self.target_temps.get(dwarf, 0)
             if temp < 170:
-                temp = 200  # Default load temp if nothing set
-            self.gcode.respond_info(f"T{tool}: Heating to {temp}C...")
-            logging.info(f"PuppyBootloader: Autoload T{tool} phase 2: "
-                        f"heating to {temp}C via M109")
-            run(f"M109 T{tool} S{temp}")
-            logging.info(f"PuppyBootloader: Autoload T{tool} M109 returned")
-
-            # --- Phase 3: Fast load 50mm @ 18mm/s (gear to nozzle) ---
-            run("G92 E0")
-            self.gcode.respond_info(f"T{tool}: Fast loading to nozzle...")
-            logging.info(f"PuppyBootloader: Autoload T{tool} phase 3: "
-                        f"fast load 50mm @ 18mm/s")
-            pos = list(toolhead.get_position())
-            pos[3] += 50.0
-            toolhead.manual_move(pos, 18.0)
-            toolhead.wait_moves()
-
-            # --- Phase 4: Purge 27mm @ 2.7mm/s (prime nozzle) ---
-            self.gcode.respond_info(f"T{tool}: Purging...")
-            logging.info(f"PuppyBootloader: Autoload T{tool} phase 4: "
-                        f"purge 27mm @ 2.7mm/s")
-            pos = list(toolhead.get_position())
-            pos[3] += 27.0
-            toolhead.manual_move(pos, 2.7)
-            toolhead.wait_moves()
-
-            # --- Phase 5: Retract 4mm @ 35mm/s (prevent ooze) ---
-            logging.info(f"PuppyBootloader: Autoload T{tool} phase 5: "
-                        f"retract 4mm @ 35mm/s")
-            pos = list(toolhead.get_position())
-            pos[3] -= 4.0
-            toolhead.manual_move(pos, 35.0)
-            toolhead.wait_moves()
-
-            # --- Phase 6: Turn off heater ---
-            run(f"M104 T{tool} S0")
-            # The hot end is full again - drop any END_PRINT deep-retract record
-            self._clear_melt_retract(tool, from_command=from_command)
-            self.gcode.respond_info(f"T{tool}: Autoload complete!")
-            logging.info(f"PuppyBootloader: Autoload T{tool} complete")
+                self._ask_filament_type(tool, 'autoload')
+                return
+            self._autoload_rest(tool, temp, '', run, from_command)
 
         finally:
             # Restore min extrude temp
             if heater is not None and saved_min_temp is not None:
                 heater.min_extrude_temp = saved_min_temp
+
+    def _autoload_rest(self, tool, temp, ftype, run, from_command):
+        """Autoload phases 2-6, from the gears on (min_extrude_temp is off
+        for the caller's whole sequence)."""
+        toolhead = self.printer.lookup_object('toolhead')
+
+        # --- Phase 2: Heat to extrusion temperature ---
+        self.gcode.respond_info(f"T{tool}: Heating to {temp}C...")
+        logging.info(f"PuppyBootloader: Autoload T{tool} phase 2: "
+                    f"heating to {temp}C via M109")
+        run(f"M109 T{tool} S{temp}")
+        logging.info(f"PuppyBootloader: Autoload T{tool} M109 returned")
+
+        # --- Phase 3: Fast load 50mm @ 18mm/s (gear to nozzle) ---
+        run("G92 E0")
+        self.gcode.respond_info(f"T{tool}: Fast loading to nozzle...")
+        logging.info(f"PuppyBootloader: Autoload T{tool} phase 3: "
+                    f"fast load 50mm @ 18mm/s")
+        pos = list(toolhead.get_position())
+        pos[3] += 50.0
+        toolhead.manual_move(pos, 18.0)
+        toolhead.wait_moves()
+
+        # --- Phase 4: Purge 27mm @ 2.7mm/s (prime nozzle) ---
+        self.gcode.respond_info(f"T{tool}: Purging...")
+        logging.info(f"PuppyBootloader: Autoload T{tool} phase 4: "
+                    f"purge 27mm @ 2.7mm/s")
+        pos = list(toolhead.get_position())
+        pos[3] += 27.0
+        toolhead.manual_move(pos, 2.7)
+        toolhead.wait_moves()
+
+        # --- Phase 5: Retract 4mm @ 35mm/s (prevent ooze) ---
+        logging.info(f"PuppyBootloader: Autoload T{tool} phase 5: "
+                    f"retract 4mm @ 35mm/s")
+        pos = list(toolhead.get_position())
+        pos[3] -= 4.0
+        toolhead.manual_move(pos, 35.0)
+        toolhead.wait_moves()
+
+        # --- Phase 6: Turn off heater ---
+        run(f"M104 T{tool} S0")
+        # The hot end is full again - drop any END_PRINT deep-retract record
+        self._clear_melt_retract(tool, from_command=from_command)
+        self._set_loaded_filament(tool, ftype, temp)
+        self.gcode.respond_info(f"T{tool}: Autoload complete!")
+        logging.info(f"PuppyBootloader: Autoload T{tool} complete")
 
     def cmd_CALIBRATE_SIDE_SENSOR(self, gcmd):
         """Start side filament sensor calibration (step 1: remove filament).
@@ -3361,6 +3470,77 @@ class PuppyBootloader:
             raise gcmd.error(f"Autoload failed: {e}")
         finally:
             self._autoload_in_progress = False
+
+    def cmd_XL_FILAMENT_TYPE(self, gcmd):
+        """Answer a load / unload that asked for the filament type.
+
+        XL_FILAMENT_TYPE TOOL=n TYPE=PLA|PETG|ASA|PC|PVB|ABS|HIPS|PP|FLEX|PA
+                         [TEMP=t]          (TEMP alone also works)
+        XL_FILAMENT_TYPE TOOL=n CANCEL=1   (a load: back out of the gears)
+        """
+        tool = gcmd.get_int('TOOL')
+        mode = self._filament_asking.get(tool)
+        if mode is None:
+            raise gcmd.error(f"T{tool} is not waiting for a filament type")
+        if self._autoload_in_progress:
+            raise gcmd.error("Autoload already in progress")
+        cancel = gcmd.get_int('CANCEL', 0)
+        ftype = gcmd.get('TYPE', '').upper()
+        temp = gcmd.get_float('TEMP', 0.)
+        if not cancel:
+            temps = dict(self.FILAMENT_TEMPS)
+            if ftype and ftype not in temps:
+                raise gcmd.error("TYPE must be one of %s" % ", ".join(
+                    name for name, _ in self.FILAMENT_TEMPS))
+            if temp <= 0 and ftype:
+                temp = temps[ftype]
+            if temp < 170:
+                raise gcmd.error("Give TYPE= or TEMP= (at least 170 C)")
+            if temp == int(temp):
+                temp = int(temp)
+        if mode != 'unload' and (not self.tool_picked
+                                 or self.active_tool != tool):
+            self._drop_filament_question(tool)
+            raise gcmd.error(f"T{tool} is no longer on the carriage - load"
+                             f" it again")
+        self._drop_filament_question(tool)
+        if mode == 'unload':
+            if cancel:
+                gcmd.respond_info(f"T{tool}: unload cancelled")
+                return
+            self.gcode.run_script_from_command(
+                f"UNLOAD_FILAMENT TOOL={tool} TEMP={temp:.0f}")
+            return
+        # 'autoload' / 'load': the filament waits in the gears.  Cold moves
+        # allowed for the whole sequence, as _do_autoload does.
+        extruder = self.printer.lookup_object('extruder', None)
+        heater = extruder.get_heater() if extruder is not None else None
+        saved_min_temp = None
+        if heater is not None:
+            saved_min_temp = heater.min_extrude_temp
+            heater.min_extrude_temp = 0
+            heater.can_extrude = True
+        self._autoload_in_progress = True
+        try:
+            if cancel:
+                gcmd.respond_info(f"T{tool}: taking the filament back out of"
+                                  f" the gears...")
+                toolhead = self.printer.lookup_object('toolhead')
+                pos = list(toolhead.get_position())
+                pos[3] -= self.GEARS_OUT_MM
+                toolhead.manual_move(pos, self.GEARS_OUT_SPEED)
+                toolhead.wait_moves()
+                gcmd.respond_info(f"T{tool}: load cancelled - pull the"
+                                  f" filament out")
+            elif mode == 'autoload':
+                self._autoload_rest(tool, temp, ftype,
+                                    self.gcode.run_script_from_command, True)
+            else:
+                self._load_rest(tool, temp, ftype)
+        finally:
+            self._autoload_in_progress = False
+            if heater is not None and saved_min_temp is not None:
+                heater.min_extrude_temp = saved_min_temp
 
     def cmd_SET_AUTOLOAD(self, gcmd):
         """Enable or disable filament autoload.
@@ -3548,15 +3728,29 @@ class PuppyBootloader:
         if dwarf not in self.booted_dwarfs:
             raise gcmd.error(f"T{tool}/Dwarf {dwarf} not booted")
 
+        # Determine temperature: TEMP, else the tool's target, else the
+        # filament its last load put in (stock: the tool's filament type)
+        if temp <= 0:
+            temp = self.target_temps.get(dwarf, 0)
+        if temp < 170:
+            ftype, ftemp = self._loaded_filament(tool)
+            if ftemp >= 170:
+                temp = int(ftemp) if ftemp == int(ftemp) else ftemp
+                gcmd.respond_info(f"Using T{tool}'s loaded filament temp:"
+                                  f" {temp}C" + (f" ({ftype})" if ftype else ""))
+            elif gcmd.get_int('ASK', 0):
+                # stock M702: type not known - ask before anything moves.
+                # ASK=1 = the Unload button only; M600 and scripts carry on.
+                self._ask_filament_type(tool, 'unload')
+                return
+        self._drop_filament_question(tool)
+
         # Pick tool if not active. After a boot with an empty carriage
         # active_tool is 0 but nothing is picked, so check tool_picked too.
         if not self.tool_picked or self.active_tool != tool:
             gcmd.respond_info(f"Picking T{tool}...")
             self.gcode.run_script_from_command(f"T{tool}")
 
-        # Determine temperature
-        if temp <= 0:
-            temp = self.target_temps.get(dwarf, 0)
         if temp < 170:
             temp = 200  # Minimum safe unload temp
             gcmd.respond_info(f"Using default unload temp: {temp}C")
@@ -3582,6 +3776,7 @@ class PuppyBootloader:
         # Whole path is empty now - the END_PRINT deep-retract record is stale.
         # The next load refills the hot end, so START_PRINT must not add to it.
         self._clear_melt_retract(tool)
+        self._set_loaded_filament(tool, '', 0)
 
         # Check sensor
         data = self.dwarf_data.get(dwarf, {})
@@ -3609,6 +3804,11 @@ class PuppyBootloader:
 
         if dwarf not in self.booted_dwarfs:
             raise gcmd.error(f"T{tool}/Dwarf {dwarf} not booted")
+        if self._filament_asking.get(tool) in ('autoload', 'load'):
+            # its filament is already in the gears, waiting for the type
+            self._ask_filament_type(tool, self._filament_asking[tool])
+            return
+        self._drop_filament_question(tool)
 
         # Pick tool if not active. After a boot with an empty carriage
         # active_tool is 0 but nothing is picked, so check tool_picked too.
@@ -3640,12 +3840,9 @@ class PuppyBootloader:
             gcmd.respond_info("Sensor not calibrated - waiting 5s for manual insertion...")
             self.reactor.pause(self.reactor.monotonic() + 5.0)
 
-        # Determine temperature
+        # Determine temperature: TEMP, else the tool's target
         if temp <= 0:
             temp = self.target_temps.get(dwarf, 0)
-        if temp < 170:
-            temp = 200  # Minimum safe load temp
-            gcmd.respond_info(f"Using default load temp: {temp}C")
 
         # Slow load to gears: 5.4mm/s = 324mm/min, 30mm
         # Prusa allows cold extrusion for this step
@@ -3655,16 +3852,27 @@ class PuppyBootloader:
         self.gcode.run_script_from_command("G1 E30 F324")    # 5.4mm/s, 30mm
         self.gcode.run_script_from_command("M302 S170")      # Restore cold extrusion limit
 
+        # Stock M701: the filament is in the gears - nothing set, so ask its
+        # type and stop here; XL_FILAMENT_TYPE carries on
+        if temp < 170:
+            self._ask_filament_type(tool, 'load')
+            return
+        self._load_rest(tool, temp, '')
+
+    def _load_rest(self, tool, temp, ftype):
+        """LOAD_FILAMENT from the gears on: heat, fast load, purge, retract."""
+        respond = self.gcode.respond_info
+
         # Heat and wait
-        gcmd.respond_info(f"Heating T{tool} to {temp}C...")
+        respond(f"Heating T{tool} to {temp}C...")
         self.gcode.run_script_from_command(f"M109 T{tool} S{temp}")
 
         # Fast load: 18mm/s = 1080mm/min, 40mm (fill hotend)
-        gcmd.respond_info("Fast loading...")
+        respond("Fast loading...")
         self.gcode.run_script_from_command("G1 E40 F1080")
 
         # Purge: 2.7mm/s = 162mm/min, 27mm
-        gcmd.respond_info("Purging...")
+        respond("Purging...")
         self.gcode.run_script_from_command("G1 E27 F162")
 
         # Retract to prevent ooze: 35mm/s = 2100mm/min, 4mm
@@ -3673,8 +3881,9 @@ class PuppyBootloader:
 
         # The hot end is full again - drop any END_PRINT deep-retract record
         self._clear_melt_retract(tool)
+        self._set_loaded_filament(tool, ftype, temp)
 
-        gcmd.respond_info(f"T{tool}: Filament loaded and purged")
+        respond(f"T{tool}: Filament loaded and purged")
 
     def cmd_M600(self, gcmd):
         """M600 - Filament change (Prusa compatibility).
@@ -6129,11 +6338,27 @@ class PuppyBootloader:
                                     self.ALIGN_HOMING_SPEED, must_trigger=False)
         toolhead.wait_moves()
         self._align_home_x_inverted(gcmd)       # "Bump right edge"
-        # current_position.x = X_MAX_POS; "Return to left edge before homing"
+        # "Return to left edge before homing": stock sets X = X_MAX_POS and
+        # travels to X 0 at 400 mm/s, trusting the bump.  On KlipperXL-Plus
+        # (same XLBuddy motion) the two hits once tripped near the front-left
+        # corner - the carriage never went right - and that return drove into
+        # the left frame.  Here the return watches the X stall endstop at
+        # homing speed and measures the way to the left frame.
+        width = self._align_homing_move(
+            0, -1.5 * (self.ALIGN_X_MAX_POS - self.ALIGN_X_MIN_POS),
+            self.ALIGN_HOMING_SPEED, must_trigger=True)
+        logging.info("PuppyBootloader: right edge to left frame %.1f mm"
+                     % (width,))
+        if width < self.ALIGN_MIN_WIDTH:
+            raise gcmd.error("Toolchanger lock alignment: the right edge hits"
+                             " were only %.0f mm from the left frame - not the"
+                             " right edge.  Check nothing blocks the carriage,"
+                             " then home again." % (width,))
+        # at the left frame (X_MIN_POS); on to X 0, where stock's return ends
         pos = toolhead.get_position()
-        pos[0] = self.ALIGN_X_MAX_POS
+        pos[0] = self.ALIGN_X_MIN_POS
         toolhead.set_position(pos, homing_axes="x")
-        toolhead.manual_move([0., None, None], self.ALIGN_TRAVEL_SPEED)
+        toolhead.manual_move([0., None, None], self.ALIGN_HOMING_SPEED)
         toolhead.wait_moves()
 
     def _align_home_x_inverted(self, gcmd):

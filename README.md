@@ -6,7 +6,11 @@
 <p align="center"><b>Run Klipper firmware on your Prusa XL.</b></p>
 
 ## 🆕 KlipperXL-Plus is out
-The next step for Klipper on the Prusa XL: **Klipper runs on every tool itself**, and it installs from one SD card with Raspberry Pi Imager. No terminal, no commands to type, guided calibration wizards. Prusa's factory bootloaders stay untouched, so going back to stock is just Prusa's own firmware file.
+Enjoyed KlipperXL? **KlipperXL-Plus** is its updated, more complete version:
+- **Klipper runs on every tool itself**, not just the mainboard
+- **It installs itself:** one SD card with Raspberry Pi Imager, then an installer page in your browser builds the firmware, walks you through the mainboard flash and flashes every tool. No terminal, no commands to type
+- **Updates from Mainsail's update list**, and guided calibration wizards
+- Prusa's factory bootloaders stay untouched, so going back to stock is just Prusa's own firmware file
 
 👉 **[github.com/racoutlaw/KlipperXL-Plus](https://github.com/racoutlaw/KlipperXL-Plus)** · [Install guide](https://github.com/racoutlaw/KlipperXL-Plus/blob/main/docs/INSTALL.md)
 
@@ -131,8 +135,8 @@ KlipperXL/
 | `CLEAR_BED_AREA` | Reset to full bed heating |
 | `SET_DWARF_TEMP DWARF= TEMP=` | Set individual tool temperature |
 | `DISABLE_ALL_HOTENDS` | Turn off every booted tool heater (used by END_PRINT / CANCEL_PRINT) |
-| `FILAMENT_LOAD TOOL= TEMP=` | Load filament into a tool (Prusa M701 sequence) |
-| `FILAMENT_UNLOAD TOOL= TEMP=` | Unload filament from a tool (Prusa M702 sequence) |
+| `FILAMENT_LOAD TOOL=` | Load filament into a tool (Prusa M701 sequence) - asks the filament type once the gears have it |
+| `FILAMENT_UNLOAD TOOL=` | Unload filament from a tool (Prusa M702 sequence) - heats for the type that tool was loaded with |
 | `FILAMENT_SENSORS` | Show filament sensor states and calibration for all tools |
 | `SPOOL_JOIN TO=` | Remap current tool to a different physical tool |
 | `SPOOL_JOIN_STATUS` | Show active spool join remaps |
