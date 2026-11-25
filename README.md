@@ -1,9 +1,8 @@
-<p align="center">
-  <img src="KlipperXL.png" alt="KlipperXL Logo" width="300">
-</p>
+![KlipperXL Logo](https://raw.githubusercontent.com/racoutlaw/KlipperXL/master/KlipperXL-logo-300.png)
 
-<h1 align="center">KlipperXL</h1>
-<p align="center"><b>Run Klipper firmware on your Prusa XL.</b></p>
+# KlipperXL
+
+**Run Klipper firmware on your Prusa XL.**
 
 ## 🆕 KlipperXL-Plus is out
 Enjoyed KlipperXL? **KlipperXL-Plus** is its updated, more complete version:
