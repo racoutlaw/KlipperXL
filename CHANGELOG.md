@@ -1,3 +1,35 @@
+## 2026-11-27
+
+### ADDED: calibrate the filament sensors before your first print
+
+- The filament sensors are analog. Every one reads a different raw value, so
+  each machine has to learn its own. Nothing in the guide said to do it, and a
+  sensor reading against the wrong references reports "No filament loaded" on a
+  first print, or pauses for runout with the filament plainly there
+- New **section 10.9** of the installation guide walks both sets in one pass -
+  side sensors (these are what pause a print for runout, and what autoload
+  watches) and tool sensors (these confirm a load or unload finished). Empty
+  every tool and record, load every tool and record, then check with
+  `SHOW_FILAMENT_SENSORS`
+- The commands were always there and always worked. Nothing told you to run
+  them: `CALIBRATE_SIDE_SENSOR` / `_STEP2`, `CALIBRATE_FILAMENT_SENSOR` /
+  `_STEP2`, `SHOW_FILAMENT_SENSORS`, `SHOW_SIDE_SENSORS`. They are in the Quick
+  Reference now as well
+- `config/variables.cfg` ships with my machine's calibration in it. Running
+  section 10.9 replaces it with yours. If you want to know whether you are
+  still on mine, run `SHOW_FILAMENT_SENSORS` - a `cal=` pair you never set is
+  mine
+
+Reported by **Teaching Tech** (@teachingtechYT), who hit it on a fresh install
+and told me about it.
+
+**No code or config changed** - the guide and this changelog only. Nothing to
+copy to your Pi, nothing to restart.
+
+Files: `docs/INSTALLATION_GUIDE.md`
+
+---
+
 ## 2026-10-24
 
 Three changes brought over from KlipperXL-Plus, where they run on the printer.

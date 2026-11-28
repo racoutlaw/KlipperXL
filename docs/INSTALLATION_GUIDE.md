@@ -102,7 +102,7 @@ sudo systemctl status klipper
 ~/klippy-env/bin/pip install numpy
 ```
 
-numpy is required for input shaper calibration (`CALIBRATE_INPUT_SHAPER`, section 10.9).
+numpy is required for input shaper calibration (`CALIBRATE_INPUT_SHAPER`, section 10.10).
 
 ### 2.7 Note Your Pi's IP Address
 
@@ -292,7 +292,7 @@ cp ~/KlipperXL/config/printer.cfg ~/printer_data/config/printer.cfg
 # Tool offsets (will need recalibration for your machine)
 cp ~/KlipperXL/config/tool_offsets.cfg ~/printer_data/config/tool_offsets.cfg
 
-# Variables file
+# Variables file (holds my filament sensor calibration - replace it in 10.9)
 cp ~/KlipperXL/config/variables.cfg ~/printer_data/config/variables.cfg
 
 # Automatic per-tool Pressure Advance
@@ -846,7 +846,83 @@ M109 T0 S200    ; Wait for T0
 
 Verify temperatures in the web UI match expectations.
 
-### 10.9 Calibrate Input Shaper
+### 10.9 Calibrate Filament Sensors
+
+**Do this before your first print.**
+
+The filament sensors are analog, and every one reads a different raw value. The
+`variables.cfg` you copied in section 5.1 came off my printer, with my sensors'
+references in it. Until you replace them with your own, your printer is judging
+your filament against my numbers — and it will not say it is unsure. It will
+report "filament" or "no filament" with full confidence and get it wrong. That
+shows up as "No filament loaded" on a first print, or a runout pause with the
+filament plainly sitting there.
+
+There are two sets, and both need doing:
+
+- **Side sensors** — one per spool position. These are what trigger a runout
+  pause mid-print, and what autoload watches.
+- **Tool sensors** — one per Dwarf. These confirm a load or unload finished.
+
+Filament passes the side sensor on its way to the tool, so both sets calibrate
+together: record every sensor empty, then record every sensor with filament in.
+
+**Step 1 — all five tools empty**
+
+Unload filament from all five tools and pull it back out of the side sensors,
+then:
+
+```gcode
+CALIBRATE_SIDE_SENSOR
+CALIBRATE_FILAMENT_SENSOR
+```
+
+Each prints a no-filament reference per tool. A tool that reads outside 20–4096
+reports `Sensor not connected` and is skipped — check that tool's cable before
+going on.
+
+**Step 2 — all five tools loaded**
+
+Heat each tool and load filament through its side sensor into the toolhead until
+the tool sensor sees it (`LOAD_FILAMENT TOOL=n`), then:
+
+```gcode
+CALIBRATE_SIDE_SENSOR_STEP2
+CALIBRATE_FILAMENT_SENSOR_STEP2
+```
+
+Step 2 checks its reading against step 1 and refuses anything too close to call:
+the loaded and empty values must differ by more than **200** ADC counts. A tool
+that fails says so by name and keeps no calibration — redo that one.
+
+Both steps save as they go. There is no `SAVE_CONFIG` to run.
+
+**Verify**
+
+```gcode
+SHOW_FILAMENT_SENSORS
+```
+
+Every tool should read `has_filament` with a `cal=nins=… ins=…` pair. Anything
+showing `NOT CALIBRATED` or `(step 2 needed)` did not take. If you want to know
+whether a tool is still on my numbers, this is where you see it — a `cal=` pair
+you never set is mine.
+
+**One tool at a time**
+
+Every command here takes an optional `TOOL=n`, so you can do a single tool
+without disturbing the rest:
+
+```gcode
+CALIBRATE_SIDE_SENSOR TOOL=2
+CALIBRATE_SIDE_SENSOR_STEP2 TOOL=2
+```
+
+**If a print pauses for runout with filament clearly loaded,** or autoload fires
+when nothing went in, that tool's side sensor is reading against the wrong
+references. Run `SHOW_SIDE_SENSORS` and redo both steps for it.
+
+### 10.10 Calibrate Input Shaper
 
 **Do this before your first real print.** `printer.cfg` ships with Prusa's own XL
 factory shaper values active:
@@ -888,7 +964,7 @@ To check what you ended up with, look for `[input_shaper]` at the end of
 > If the macro is missing entirely, `printer.cfg` was not deployed — it is defined
 > there, not in a Python module.
 
-### 10.10 Calibrate Pressure Advance (per tool)
+### 10.11 Calibrate Pressure Advance (per tool)
 
 Load filament into a tool, then click **`PA_TUNE_T0`** in the Macros panel — or
 from the console:
@@ -1071,7 +1147,7 @@ Full details, including how to get a more precise number:
 |------|---------|
 | `printer.cfg` | Main Klipper configuration |
 | `tool_offsets.cfg` | Calibrated tool X/Y/Z offsets |
-| `variables.cfg` | Saved variables (probe thresholds, etc.) |
+| `variables.cfg` | Saved variables — probe thresholds, filament sensor calibration, per-tool filament type. **Ships with the author's sensor calibration; replace it with yours in section 10.9.** |
 | `macros/print_macros.cfg` | START_PRINT, END_PRINT, PAUSE, RESUME, CANCEL macros |
 | `pa_tuner.cfg` | Pressure Advance sweep (`CALIBRATE_PA`) |
 | `pa_menu.cfg` | Per-tool PA buttons (`PA_TUNE_T0`–`T4`) |
@@ -1114,6 +1190,16 @@ Full details, including how to get a more precise number:
 | `BED_STATUS` | Show 4x4 bedlet temperature grid |
 | `SET_BED_AREA X0= Y0= X1= Y1=` | Set adaptive bed heating zone |
 | `CLEAR_BED_AREA` | Reset to full bed heating |
+
+### Filament Sensors
+| Command | Description |
+|---------|-------------|
+| `CALIBRATE_SIDE_SENSOR [TOOL=n]` | Step 1, side sensor — filament out |
+| `CALIBRATE_SIDE_SENSOR_STEP2 [TOOL=n]` | Step 2, side sensor — filament in |
+| `CALIBRATE_FILAMENT_SENSOR [TOOL=n]` | Step 1, tool sensor — filament out |
+| `CALIBRATE_FILAMENT_SENSOR_STEP2 [TOOL=n]` | Step 2, tool sensor — filament in |
+| `SHOW_FILAMENT_SENSORS` | State + calibration, tool and side sensors |
+| `SHOW_SIDE_SENSORS` | State + calibration, side sensors only |
 
 ### Filament & Spool Join
 | Command | Description |
